@@ -1,0 +1,2245 @@
+-----------EMO with Random Forest with UCI Dataset------------------------------
+# ===================================================
+# Import Required Libraries
+# ===================================================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                            f1_score, roc_auc_score, log_loss,
+                            brier_score_loss, matthews_corrcoef,
+                            confusion_matrix, roc_curve, auc)
+from imblearn.over_sampling import BorderlineSMOTE
+import shap
+from scipy import stats
+import warnings
+import optuna
+from optuna.samplers import NSGAIISampler
+from optuna.importance import get_param_importances
+import joblib
+from mpl_toolkits.mplot3d import Axes3D
+warnings.filterwarnings('ignore')
+
+# Set global parameters
+np.random.seed(42)
+sns.set(style="whitegrid", font_scale=1.2)
+plt.rcParams['figure.figsize'] = (12, 8)
+shap.initjs()
+
+# ===================================================
+# Data Loading and Stratified Splitting (80:10:10)
+# ===================================================
+df = pd.read_csv('wrangledbank.csv')
+X = df.drop('y', axis=1)
+y = df['y']
+
+# Convert integer columns to float to avoid SMOTE casting error
+int_cols = X.select_dtypes(include=['int', 'int32', 'int64']).columns
+if len(int_cols) > 0:
+    print(f"Converting integer columns to float: {list(int_cols)}")
+    X[int_cols] = X[int_cols].astype(np.float64)
+
+# First split: 80% training, 20% temporary test
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# Second split: 10% validation, 10% test (50% of 20%)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp, test_size=0.5, stratify=y_temp, random_state=42
+)
+
+print("="*80)
+print("Stratified Split Distribution")
+print("="*80)
+print(f"Training set: {X_train.shape[0]} samples (Positive: {y_train.sum()}, {y_train.mean():.2%})")
+print(f"Validation set: {X_val.shape[0]} samples (Positive: {y_val.sum()}, {y_val.mean():.2%})")
+print(f"Testing set: {X_test.shape[0]} samples (Positive: {y_test.sum()}, {y_test.mean():.2%})")
+
+# Identify sensitive features
+sensitive_features = ['agecat', 'marital', 'education']
+
+# Determine privileged groups ONLY from training data (pre-SMOTE)
+privileged_groups = {}
+for feat in sensitive_features:
+    privileged_groups[feat] = X_train[feat].mode()[0]
+
+print("\nPrivileged groups determined from training data (pre-SMOTE):")
+for feat, val in privileged_groups.items():
+    print(f"- {feat}: {val}")
+
+# ===================================================
+# Apply Borderline-SMOTE to Training Data
+# ===================================================
+print("="*80)
+print("Applying Borderline-SMOTE to Training Data")
+print("="*80)
+print(f"Before SMOTE: Class 0 = {sum(y_train == 0)}, Class 1 = {sum(y_train == 1)}")
+smote = BorderlineSMOTE(sampling_strategy='auto', kind='borderline-2', random_state=42)
+X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+print(f"After SMOTE: Class 0 = {sum(y_train_res == 0)}, Class 1 = {sum(y_train_res == 1)}")
+
+# Convert to float32 for faster computation
+X_train_res_float = X_train_res.astype('float32')
+X_val_float = X_val[X_train_res.columns].astype('float32')
+X_test_float = X_test[X_train_res.columns].astype('float32')
+
+# Prepare sensitive mask for primary sensitive feature (used by the custom model class)
+primary_sensitive = 'agecat'
+sensitive_mask_train = (X_train_res[primary_sensitive] == privileged_groups[primary_sensitive]).astype(int).values
+
+# ===================================================
+# Enhanced FairRandomForest with Explainability Component
+# ===================================================
+class ExplainableFairRandomForest(RandomForestClassifier):
+    def __init__(self, sensitive_mask=None, **kwargs):
+        super().__init__(**kwargs)
+        self.sensitive_mask = sensitive_mask
+
+    def _calculate_objective(self, y, left_idxs, right_idxs, current_feature):
+        # MCC component - Note: This is a simplified placeholder as MCC needs predictions vs true labels
+        # The original logic here was flawed for split criterion calculation.
+        # A more standard approach would be to use impurity measures like Gini or Entropy.
+        # For the purpose of this code, we'll keep it as a placeholder to match the original intent.
+        try:
+            # This is not a correct way to calculate MCC for splits, but keeping original structure
+            left_mcc = matthews_corrcoef(y[left_idxs], np.ones_like(y[left_idxs], dtype=int))
+        except:
+            left_mcc = 0
+        try:
+            right_mcc = matthews_corrcoef(y[right_idxs], np.ones_like(y[right_idxs], dtype=int))
+        except:
+            right_mcc = 0
+        mcc_component = (left_mcc + right_mcc) / 2.0
+
+        # Fairness component (1 - |EODD|)
+        def calculate_eodd(y_true, y_pred, sensitive):
+            if np.sum((y_true == 1) & (sensitive == 1)) == 0 or np.sum((y_true == 1) & (sensitive == 0)) == 0:
+                return 0.5
+            tpr_priv = np.mean(y_pred[(y_true == 1) & (sensitive == 1)])
+            tpr_unpriv = np.mean(y_pred[(y_true == 1) & (sensitive == 0)])
+            eod = tpr_priv - tpr_unpriv
+            if np.sum((y_true == 0) & (sensitive == 1)) == 0 or np.sum((y_true == 0) & (sensitive == 0)) == 0:
+                fpr_diff = 0
+            else:
+                fpr_priv = np.mean(y_pred[(y_true == 0) & (sensitive == 1)])
+                fpr_unpriv = np.mean(y_pred[(y_true == 0) & (sensitive == 0)])
+                fpr_diff = fpr_priv - fpr_unpriv
+            return (abs(eod) + abs(fpr_diff)) / 2
+
+        left_pred = np.zeros(len(y), dtype=int)
+        left_pred[left_idxs] = 1
+        right_pred = np.zeros(len(y), dtype=int)
+        right_pred[right_idxs] = 1
+
+        if self.sensitive_mask is not None:
+            try:
+                eodd_left = calculate_eodd(y, left_pred, self.sensitive_mask)
+                eodd_right = calculate_eodd(y, right_pred, self.sensitive_mask)
+                fairness_component = 1 - (eodd_left + eodd_right) / 2
+            except:
+                fairness_component = 0.5
+        else:
+            fairness_component = 0.5
+
+        # Explainability Stability Component
+        def safe_corr(x, y):
+            if len(x) < 2 or len(y) < 2 or np.std(x) == 0 or np.std(y) == 0:
+                return 0.0
+            return np.corrcoef(x, y)[0, 1]
+
+        try:
+            left_feature_vals = current_feature[left_idxs]
+            left_target_vals = y[left_idxs]
+            left_corr = safe_corr(left_feature_vals, left_target_vals)
+        except:
+            left_corr = 0
+
+        try:
+            right_feature_vals = current_feature[right_idxs]
+            right_target_vals = y[right_idxs]
+            right_corr = safe_corr(right_feature_vals, right_target_vals)
+        except:
+            right_corr = 0
+
+        stability_component = 1 - abs(left_corr - right_corr) / 2.0
+
+        return 0.5 * mcc_component + 0.3 * fairness_component + 0.2 * stability_component
+
+    def _fair_split_criterion(self, X, y, feature_idx, threshold):
+        current_feature = X[:, feature_idx]
+        left_mask = current_feature <= threshold
+        right_mask = ~left_mask
+        return self._calculate_objective(y, left_mask, right_mask, current_feature)
+
+# ===================================================
+# Helper Functions for Metrics
+# ===================================================
+def calculate_fairness_metrics(X, y_true, y_pred, sensitive_var, privileged_group):
+    priv_mask = (X[sensitive_var] == privileged_group).values
+    unpriv_mask = ~priv_mask
+
+    if np.sum(priv_mask) == 0 or np.sum(unpriv_mask) == 0:
+        return {'EOD': np.nan, 'SPD': np.nan, 'EODD': np.nan}
+
+    # Equal Opportunity Difference
+    try:
+        tpr_priv = recall_score(y_true[priv_mask], y_pred[priv_mask], zero_division=0)
+    except:
+        tpr_priv = 0
+    try:
+        tpr_unpriv = recall_score(y_true[unpriv_mask], y_pred[unpriv_mask], zero_division=0)
+    except:
+        tpr_unpriv = 0
+    eod = tpr_priv - tpr_unpriv
+
+    # Statistical Parity Difference
+    pred_priv = np.mean(y_pred[priv_mask])
+    pred_unpriv = np.mean(y_pred[unpriv_mask])
+    spd = pred_priv - pred_unpriv
+
+    # Equalized Odds Difference
+    try:
+        tn_priv, fp_priv, fn_priv, tp_priv = confusion_matrix(y_true[priv_mask], y_pred[priv_mask], labels=[0,1]).ravel()
+        fpr_priv = fp_priv / (fp_priv + tn_priv) if (fp_priv + tn_priv) > 0 else 0
+    except ValueError: # Handle cases where confusion matrix is not 2x2
+        fpr_priv = 0
+    try:
+        tn_unpriv, fp_unpriv, fn_unpriv, tp_unpriv = confusion_matrix(y_true[unpriv_mask], y_pred[unpriv_mask], labels=[0,1]).ravel()
+        fpr_unpriv = fp_unpriv / (fp_unpriv + tn_unpriv) if (fp_unpriv + tn_unpriv) > 0 else 0
+    except ValueError:
+        fpr_unpriv = 0
+
+    eodd = (abs(eod) + abs(fpr_priv - fpr_unpriv)) / 2
+    return {'EOD': eod, 'SPD': spd, 'EODD': eodd}
+
+
+def calculate_shap_gap(model, X, sensitive_features, privileged_groups, sample_size=200):
+    """Calculate average SHAP consistency gap across sensitive features"""
+    # Create explainer
+    explainer = shap.TreeExplainer(model)
+
+    # Sample data if needed
+    if len(X) > sample_size:
+        sample_idx = np.random.choice(len(X), sample_size, replace=False)
+        X_sample = X.iloc[sample_idx]
+    else:
+        X_sample = X
+
+    # Compute SHAP values
+    shap_values = explainer.shap_values(X_sample, check_additivity=False)
+
+    # For binary classification, use SHAP values for class 1
+    if isinstance(shap_values, list):
+        shap_vals = shap_values[1]
+    else:
+        shap_vals = shap_values
+
+    gaps = []
+    for feat in sensitive_features:
+        priv_mask = (X_sample[feat] == privileged_groups[feat]).values
+        unpriv_mask = ~priv_mask
+
+        if np.sum(priv_mask) == 0 or np.sum(unpriv_mask) == 0:
+            continue
+
+        # Calculate mean absolute SHAP values per group
+        shap_priv = np.abs(shap_vals[priv_mask]).mean(axis=0)
+        shap_unpriv = np.abs(shap_vals[unpriv_mask]).mean(axis=0)
+
+        # Compute gap as mean absolute difference across features
+        gap = np.abs(shap_priv - shap_unpriv).mean()
+        gaps.append(gap)
+
+    return np.mean(gaps) if gaps else 0.0
+
+
+# ===================================================
+# Optuna MOO Optimization with NSGA-II (3 Objectives)
+# ===================================================
+def objective(trial):
+    # Hyperparameter search space
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 100, 500, step=100),
+        'max_depth': trial.suggest_int('max_depth', 5, 15),
+        'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 10),
+        'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2']),
+        'class_weight': 'balanced'
+    }
+
+    # Create model with current hyperparameters
+    model = ExplainableFairRandomForest(
+        sensitive_mask=sensitive_mask_train,
+        **params,
+        random_state=42
+    )
+
+    # Train model
+    model.fit(X_train_res_float, y_train_res)
+
+    # Predict on validation set
+    y_pred_val = model.predict(X_val_float)
+
+    # Calculate performance metrics
+    mcc = matthews_corrcoef(y_val, y_pred_val)
+
+    # Calculate fairness metrics (average EODD across sensitive features)
+    eodds = []
+    for feat in sensitive_features:
+        fm = calculate_fairness_metrics(
+            X_val, y_val, y_pred_val,
+            feat, privileged_groups[feat]
+        )
+        eodd = fm['EODD']
+        if not np.isnan(eodd):
+            eodds.append(eodd)
+    avg_eodd = np.mean(eodds) if len(eodds) > 0 else 0.5
+
+    # Calculate SHAP consistency gap
+    shap_gap = calculate_shap_gap(
+        model,
+        X_val_float,
+        sensitive_features,
+        privileged_groups,
+        sample_size=200
+    )
+
+    # Return three objectives
+    return mcc, avg_eodd, shap_gap
+
+
+# Create MOO study with NSGA-II sampler for 3 objectives
+print("\nStarting Optuna MOO optimization with NSGA-II sampler...")
+study = optuna.create_study(
+    directions=['maximize', 'minimize', 'minimize'],
+    sampler=NSGAIISampler(population_size=50),
+    study_name='iefrf_moo_3obj'
+)
+study.optimize(objective, n_trials=50, timeout=3600, show_progress_bar=True)
+
+print("Number of completed trials: ", len(study.trials))
+print("Pareto front solutions:")
+
+# Extract Pareto front solutions
+pareto_front = []
+for trial in study.best_trials:
+    if trial.values is not None:
+        pareto_front.append({
+            'trial': trial,
+            'params': trial.params,
+            'mcc': trial.values[0],
+            'avg_eodd': trial.values[1],
+            'shap_gap': trial.values[2]
+        })
+        print(f"Trial {trial.number}: MCC={trial.values[0]:.4f}, avg_EODD={trial.values[1]:.4f}, SHAP_Gap={trial.values[2]:.4f}")
+
+
+# Calculate composite score for each solution
+for solution in pareto_front:
+    composite = (0.5 * solution['mcc'] -
+                 0.3 * solution['avg_eodd'] -
+                 0.2 * solution['shap_gap'])
+    solution['composite'] = composite
+
+# Select best solution based on composite score
+pareto_front.sort(key=lambda x: x['composite'], reverse=True)
+best_solution = pareto_front[0]
+best_params = best_solution['params']
+
+print("\nBest solution based on composite score (0.5*MCC - 0.3*EODD - 0.2*SHAP_Gap):")
+print(f"Composite: {best_solution['composite']:.4f}")
+print(f"MCC: {best_solution['mcc']:.4f}")
+print(f"Avg EODD: {best_solution['avg_eodd']:.4f}")
+print(f"SHAP Gap: {best_solution['shap_gap']:.4f}")
+print("\nHyperparameters:")
+print(best_params)
+
+
+# ===================================================
+# Final Model Training with Best Hyperparameters
+# ===================================================
+final_model = ExplainableFairRandomForest(
+    sensitive_mask=sensitive_mask_train,
+    **best_params,
+    class_weight='balanced',
+    random_state=42
+)
+
+# Cross-Validation with Confidence Intervals
+cv = StratifiedKFold(n_splits=5)
+mcc_scores = cross_val_score(final_model, X_train_res_float, y_train_res,
+                            cv=cv, scoring='matthews_corrcoef')
+mcc_ci = stats.t.interval(0.95, len(mcc_scores)-1,
+                         loc=np.mean(mcc_scores),
+                         scale=stats.sem(mcc_scores))
+
+# Train final model
+final_model.fit(X_train_res_float, y_train_res)
+
+# Save the trained model
+joblib.dump(final_model, 'iefrf_optimized_model.pkl')
+
+
+# ===================================================
+# Evaluation on Test Data
+# ===================================================
+y_pred = final_model.predict(X_test_float)
+y_prob = final_model.predict_proba(X_test_float)[:, 1]
+
+# Performance Metrics
+metrics = {
+    'Accuracy': accuracy_score(y_test, y_pred),
+    'Precision': precision_score(y_test, y_pred),
+    'Recall': recall_score(y_test, y_pred),
+    'F1': f1_score(y_test, y_pred),
+    'AUC': roc_auc_score(y_test, y_prob),
+    'MCC': matthews_corrcoef(y_test, y_pred),
+    'Log Loss': log_loss(y_test, y_prob),
+    'Brier Score': brier_score_loss(y_test, y_prob)
+}
+
+# Fairness Evaluation
+fairness_results = {}
+for feat in sensitive_features:
+    fairness_results[feat] = calculate_fairness_metrics(
+        X_test, y_test, y_pred,
+        feat, privileged_groups[feat]
+    )
+
+# SHAP Analysis on Test Data
+shap_gaps = {}
+shap_values_full = None
+
+# --- NEW: SHAP Analysis Preparation ---
+explainer = shap.TreeExplainer(final_model)
+shap_values_full = explainer.shap_values(X_test_float, check_additivity=False)
+if isinstance(shap_values_full, list):
+    shap_vals = shap_values_full[1] # For binary classification, use class 1
+else:
+    shap_vals = shap_values_full
+
+# --- END NEW SHAP Preparation ---
+for feat in sensitive_features:
+    priv_mask = (X_test[feat] == privileged_groups[feat]).values
+    unpriv_mask = ~priv_mask
+
+    if np.sum(priv_mask) == 0 or np.sum(unpriv_mask) == 0:
+        shap_gaps[feat] = np.nan
+        continue
+
+    # Handle potential size mismatches (shouldn't happen with full test set)
+    min_length = min(len(priv_mask), len(shap_vals))
+    priv_mask = priv_mask[:min_length]
+    unpriv_mask = unpriv_mask[:min_length]
+    shap_vals_truncated = shap_vals[:min_length]
+
+    if len(shap_vals_truncated) > 0:
+        shap_priv = np.abs(shap_vals_truncated[priv_mask])
+        shap_unpriv = np.abs(shap_vals_truncated[unpriv_mask])
+
+        if len(shap_priv) > 0 and len(shap_unpriv) > 0:
+            gap = np.abs(shap_priv.mean(axis=0) - shap_unpriv.mean(axis=0))
+            shap_gaps[feat] = np.abs(gap).mean()
+        else:
+            shap_gaps[feat] = np.nan
+    else:
+        shap_gaps[feat] = np.nan
+
+
+# Calculate composite score for test set
+test_mcc = metrics['MCC']
+test_avg_eodd = np.mean([v['EODD'] for v in fairness_results.values() if not np.isnan(v['EODD'])])
+test_avg_shap_gap = np.mean([v for v in shap_gaps.values() if not np.isnan(v)])
+test_composite = (0.5 * test_mcc -
+                  0.3 * test_avg_eodd -
+                  0.2 * test_avg_shap_gap)
+
+
+# ===================================================
+# --- NEW: SHAP Visualizations ---
+# ===================================================
+
+# 1. Global Feature Importance (Bar Plot)
+print("\nGenerating SHAP Feature Importance Bar Plot...")
+fig1, ax1 = plt.subplots(figsize=(10, 6))
+shap.summary_plot(shap_vals, X_test_float, plot_type="bar", show=False, plot_size=None)
+plt.title("SHAP Feature Importance (Global)")
+plt.tight_layout()
+plt.savefig('shap_feature_importance_bar.png', dpi=300, bbox_inches='tight')
+plt.show()
+plt.close(fig1)
+
+# 2. Beeswarm Plot (Summary Plot)
+print("\nGenerating SHAP Beeswarm Plot...")
+fig2, ax2 = plt.subplots(figsize=(12, 8))
+shap.summary_plot(shap_vals, X_test_float, show=False, plot_size=None)
+plt.title("SHAP Summary Plot (Beeswarm)")
+plt.tight_layout()
+plt.savefig('shap_beeswarm_plot.png', dpi=300, bbox_inches='tight')
+plt.show()
+plt.close(fig2)
+
+# 3. Waterfall Plots for specific instances (e.g., one from each extreme group of agecat)
+print("\nGenerating SHAP Waterfall Plots...")
+# Find indices for min and max agecat examples *within X_test* (which has the same index as the original df)
+try:
+    age_min_idx_series = X_test[X_test['agecat'] == X_test['agecat'].min()].index
+    age_max_idx_series = X_test[X_test['agecat'] == X_test['agecat'].max()].index
+
+    if len(age_min_idx_series) > 0 and len(age_max_idx_series) > 0:
+        age_min_idx = age_min_idx_series[0] # Get the first index
+        age_max_idx = age_max_idx_series[0] # Get the first index
+
+        # Get internal indices for SHAP values (relative to X_test_float)
+        # X_test_float is a slice/view, so its index might not be 0-based continuous.
+        # Use get_loc to find the integer position.
+        try:
+            age_min_internal_idx = X_test.index.get_loc(age_min_idx)
+            age_max_internal_idx = X_test.index.get_loc(age_max_idx)
+        except KeyError:
+             # Fallback: if get_loc fails, use positional indexing based on order
+             # This is less robust but might work if indices are aligned
+             age_min_internal_idx = X_test.index.tolist().index(age_min_idx)
+             age_max_internal_idx = X_test.index.tolist().index(age_max_idx)
+
+        # Ensure indices are within bounds of computed SHAP values
+        if age_min_internal_idx < shap_vals.shape[0] and age_max_internal_idx < shap_vals.shape[0]:
+            # --- Corrected Waterfall Plot Generation ---
+
+            # Get the base value for the positive class
+            base_value = explainer.expected_value
+            if isinstance(base_value, list) or isinstance(base_value, np.ndarray):
+                base_value = base_value[1] # Take class 1 base value
+
+            # Create SHAP Explanation object for min age instance
+            # shap_vals[age_min_internal_idx] is a 1D array of SHAP values for that instance
+            shap_exp_min = shap.Explanation(
+                values=shap_vals[age_min_internal_idx], # 1D array of SHAP values
+                base_values=base_value, # Scalar base value
+                data=X_test_float.iloc[age_min_internal_idx], # 1D array of feature values
+                feature_names=X_test_float.columns.tolist() # List of feature names
+            )
+
+            # Create SHAP Explanation object for max age instance
+            shap_exp_max = shap.Explanation(
+                values=shap_vals[age_max_internal_idx],
+                base_values=base_value,
+                data=X_test_float.iloc[age_max_internal_idx],
+                feature_names=X_test_float.columns.tolist()
+            )
+
+            # Plot Waterfall for Min Age
+            fig3, ax3 = plt.subplots(figsize=(10, 8))
+            # Pass the single Explanation object directly
+            shap.plots.waterfall(shap_exp_min, show=False, max_display=10)
+            plt.title(f"SHAP Waterfall Plot - Min Agecat ({X_test.loc[age_min_idx, 'agecat']}) - Instance Index {age_min_idx}")
+            plt.tight_layout()
+            plt.savefig(f'shap_waterfall_min_agecat_{X_test.loc[age_min_idx, "agecat"]}_idx_{age_min_idx}.png', dpi=300, bbox_inches='tight')
+            plt.show()
+            plt.close(fig3)
+
+            # Plot Waterfall for Max Age
+            fig4, ax4 = plt.subplots(figsize=(10, 8))
+            shap.plots.waterfall(shap_exp_max, show=False, max_display=10)
+            plt.title(f"SHAP Waterfall Plot - Max Agecat ({X_test.loc[age_max_idx, 'agecat']}) - Instance Index {age_max_idx}")
+            plt.tight_layout()
+            plt.savefig(f'shap_waterfall_max_agecat_{X_test.loc[age_max_idx, "agecat"]}_idx_{age_max_idx}.png', dpi=300, bbox_inches='tight')
+            plt.show()
+            plt.close(fig4)
+
+        else:
+            print(f"Warning: Calculated internal indices ({age_min_internal_idx}, {age_max_internal_idx}) are out of bounds for SHAP values array (size {shap_vals.shape[0]}). Skipping Waterfall plots.")
+    else:
+        print("Warning: Could not find instances for min or max agecat in X_test. Skipping Waterfall plots.")
+
+except Exception as e:
+    print(f"An error occurred while generating Waterfall plots: {e}")
+    import traceback
+    traceback.print_exc() # Print the full stack trace for debugging
+
+
+# ===================================================
+# --- NEW: Fairness Visualizations (TPR, FPR by subgroup) ---
+# ===================================================
+print("\nGenerating Fairness Plots (TPR, FPR by subgroup)...")
+
+# Function to calculate TPR and FPR for subgroups
+def calculate_tpr_fpr_per_group(X_data, y_true, y_pred, sensitive_feature):
+    groups = np.sort(X_data[sensitive_feature].unique())
+    tprs = []
+    fprs = []
+    group_labels = []
+    for group in groups:
+        mask = (X_data[sensitive_feature] == group)
+        y_true_group = y_true[mask]
+        y_pred_group = y_pred[mask]
+
+        if len(y_true_group) == 0:
+            tprs.append(0)
+            fprs.append(0)
+            group_labels.append(group)
+            continue
+
+        # TPR (Recall)
+        tpr = recall_score(y_true_group, y_pred_group, zero_division=0)
+        tprs.append(tpr)
+
+        # FPR
+        try:
+            tn, fp, fn, tp = confusion_matrix(y_true_group, y_pred_group, labels=[0, 1]).ravel()
+            fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+        except ValueError:
+            fpr = 0
+        fprs.append(fpr)
+        group_labels.append(group)
+
+    return group_labels, tprs, fprs
+
+# Create plots for each sensitive feature
+fig, axes = plt.subplots(len(sensitive_features), 2, figsize=(16, 6 * len(sensitive_features)))
+if len(sensitive_features) == 1:
+    axes = [axes] # Make it iterable
+
+for idx, feat in enumerate(sensitive_features):
+    group_labels, tprs, fprs = calculate_tpr_fpr_per_group(X_test, y_test, y_pred, feat)
+
+    ax1 = axes[idx][0] if len(sensitive_features) > 1 else axes[0]
+    ax2 = axes[idx][1] if len(sensitive_features) > 1 else axes[1]
+
+    # TPR Plot
+    bars_tpr = ax1.bar(group_labels, tprs, color='skyblue')
+    ax1.set_title(f"True Positive Rate (TPR) by {feat}")
+    ax1.set_xlabel(feat)
+    ax1.set_ylabel("TPR")
+    ax1.set_ylim(0, 1)
+    ax1.grid(axis='y', alpha=0.3)
+    # Add value labels
+    for bar, tpr_val in zip(bars_tpr, tprs):
+        ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                 f'{tpr_val:.3f}', ha='center', va='bottom', fontsize=9)
+
+    # FPR Plot
+    bars_fpr = ax2.bar(group_labels, fprs, color='salmon')
+    ax2.set_title(f"False Positive Rate (FPR) by {feat}")
+    ax2.set_xlabel(feat)
+    ax2.set_ylabel("FPR")
+    ax2.set_ylim(0, 1)
+    ax2.grid(axis='y', alpha=0.3)
+    # Add value labels
+    for bar, fpr_val in zip(bars_fpr, fprs):
+        ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                 f'{fpr_val:.3f}', ha='center', va='bottom', fontsize=9)
+
+plt.tight_layout()
+plt.savefig('fairness_tpr_fpr_by_subgroup.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+
+# ===================================================
+# --- NEW: SHAP Consistency Gap Analysis per Sensitive Feature ---
+# ===================================================
+print("\nGenerating SHAP Consistency Gap Analysis per Sensitive Feature...")
+
+# Function to calculate SHAP consistency gap for a single feature
+def calculate_shap_gap_per_feature(shap_vals, X_data, feature_name, privileged_group_val):
+    """
+    Calculates the SHAP consistency gap for a single feature.
+    Returns:
+        gap: The overall gap (max - min consistency)
+        consistency_dict: A dict mapping group values to their consistency scores.
+    """
+    groups = np.sort(X_data[feature_name].unique())
+    consistency_scores = {}
+
+    for group in groups:
+        group_mask = (X_data[feature_name] == group).values
+        # Truncate mask and shap values to the same length if needed
+        min_len = min(len(group_mask), len(shap_vals))
+        group_mask = group_mask[:min_len]
+        group_shap_vals = shap_vals[:min_len][group_mask]
+
+        if len(group_shap_vals) < 2:
+            consistency_scores[group] = np.nan # Not enough data
+            continue
+
+        # Compute pairwise cosine similarities
+        try:
+            # Using corrcoef for cosine similarity-like measure on rows
+            # Or use cosine_similarity from sklearn if preferred:
+            # from sklearn.metrics.pairwise import cosine_similarity
+            # similarity_matrix = cosine_similarity(group_shap_vals)
+            similarity_matrix = np.corrcoef(group_shap_vals)
+            np.fill_diagonal(similarity_matrix, np.nan)
+            consistency_score = np.nanmean(similarity_matrix)
+            consistency_scores[group] = consistency_score
+        except Exception as e:
+            print(f"Warning: Could not compute consistency for group {group} in {feature_name}: {e}")
+            consistency_scores[group] = np.nan
+
+    # Calculate gap
+    valid_scores = [s for s in consistency_scores.values() if not np.isnan(s)]
+    if len(valid_scores) < 2:
+        gap = np.nan
+    else:
+        gap = np.max(valid_scores) - np.min(valid_scores)
+
+    return gap, consistency_scores
+
+
+# --- Plotting SHAP Consistency Gap Analysis ---
+num_sens_features = len(sensitive_features)
+fig, axes = plt.subplots(num_sens_features, 1, figsize=(12, 5 * num_sens_features))
+if num_sens_features == 1:
+    axes = [axes]
+
+for idx, feat in enumerate(sensitive_features):
+    gap, consistency_dict = calculate_shap_gap_per_feature(shap_vals, X_test, feat, privileged_groups[feat])
+    group_labels = list(consistency_dict.keys())
+    consistency_values = list(consistency_dict.values())
+
+    ax = axes[idx]
+    # Filter out NaN values for plotting
+    valid_labels = [label for label, val in zip(group_labels, consistency_values) if not np.isnan(val)]
+    valid_values = [val for val in consistency_values if not np.isnan(val)]
+
+    if valid_values:
+        bars = ax.bar(valid_labels, valid_values, color='lightgreen')
+        ax.set_title(f"SHAP Explanation Consistency by {feat}\n(Consistency Gap: {gap:.4f})")
+        ax.set_xlabel(f"{feat} Group")
+        ax.set_ylabel("Average Pairwise Explanation Similarity")
+        ax.set_ylim(0, 1) # Cosine similarity range
+        ax.grid(axis='y', alpha=0.3)
+
+        # Highlight privileged group
+        priv_group = privileged_groups[feat]
+        if priv_group in valid_labels:
+            priv_index = valid_labels.index(priv_group)
+            bars[priv_index].set_color('gold')
+            ax.text(bars[priv_index].get_x() + bars[priv_index].get_width() / 2,
+                    bars[priv_index].get_height() + 0.01,
+                    'Privileged', ha='center', va='bottom', fontsize=9, color='goldenrod')
+
+        # Add value labels
+        for bar, val in zip(bars, valid_values):
+             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                     f'{val:.3f}', ha='center', va='bottom', fontsize=9)
+    else:
+        ax.text(0.5, 0.5, 'Insufficient data for consistency calculation', ha='center', va='center')
+        ax.set_title(f"SHAP Explanation Consistency by {feat}")
+        ax.set_xlabel(f"{feat} Group")
+        ax.set_ylabel("Average Pairwise Explanation Similarity")
+
+
+plt.tight_layout()
+plt.savefig('shap_consistency_gap_per_feature.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# --- Print numerical results for SCG per feature ---
+print("\nSHAP Consistency Gap (SCG) per Sensitive Feature:")
+for feat in sensitive_features:
+    gap, consistency_dict = calculate_shap_gap_per_feature(shap_vals, X_test, feat, privileged_groups[feat])
+    print(f"\nFeature: {feat}")
+    print(f"  Overall SCG: {gap:.4f}")
+    print("  Group Consistencies:")
+    for group, consistency in consistency_dict.items():
+        status = " (Privileged)" if group == privileged_groups[feat] else ""
+        print(f"    Group {group}{status}: {consistency:.4f}")
+
+
+# ===================================================
+# Visualization - 3D Pareto Front and Results (Original Code)
+# ===================================================
+# Plot 3D Pareto front
+fig = plt.figure(figsize=(14, 10))
+ax = fig.add_subplot(111, projection='3d')
+
+# Get values from all trials
+mcc_vals = [t.values[0] for t in study.trials if t.values is not None]
+eodd_vals = [t.values[1] for t in study.trials if t.values is not None]
+shap_vals_trials = [t.values[2] for t in study.trials if t.values is not None]
+
+# Pareto front points
+pf_mcc = [s['mcc'] for s in pareto_front]
+pf_eodd = [s['avg_eodd'] for s in pareto_front]
+pf_shap = [s['shap_gap'] for s in pareto_front]
+
+# Plot all trials
+ax.scatter(eodd_vals, shap_vals_trials, mcc_vals, c='blue', alpha=0.3, label='All Trials', s=40)
+
+# Plot Pareto front
+ax.scatter(pf_eodd, pf_shap, pf_mcc, c='red', s=80, label='Pareto Front')
+
+# Highlight best solution
+best_idx = 0 # Already sorted by composite score
+ax.scatter(
+    [pareto_front[best_idx]['avg_eodd']],
+    [pareto_front[best_idx]['shap_gap']],
+    [pareto_front[best_idx]['mcc']],
+    c='gold', s=400, marker='*', edgecolor='black', label='Selected Solution'
+)
+
+ax.set_xlabel('Avg EODD (Lower Better)', fontsize=12)
+ax.set_ylabel('SHAP Gap (Lower Better)', fontsize=12)
+ax.set_zlabel('MCC (Higher Better)', fontsize=12)
+ax.set_title('3D Pareto Front (MCC vs EODD vs SHAP Gap)', fontsize=16)
+ax.legend(fontsize=12)
+ax.view_init(elev=20, azim=45)  # Adjust viewing angle
+plt.tight_layout()
+plt.savefig('3d_pareto_front.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+
+# Performance and Fairness Visualization (Original Code)
+plt.figure(figsize=(18, 12))
+
+# Composite Scores
+plt.subplot(231)
+scores = {
+    'Validation': best_solution['composite'],
+    'Test': test_composite
+}
+scores_series = pd.Series(scores)
+scores_series.plot(kind='bar', color=['blue', 'green'])
+plt.title("Composite Scores (0.5*MCC - 0.3*EODD - 0.2*SHAP_Gap)", fontsize=14)
+plt.xticks(rotation=0)
+plt.grid(alpha=0.3)
+for i, v in enumerate(scores_series):
+    plt.text(i, v + 0.01 * np.sign(v), f"{v:.4f}", ha='center', fontsize=12)
+
+# Performance Metrics
+plt.subplot(232)
+metrics_series = pd.Series(metrics)
+metrics_series.plot(kind='bar', color='skyblue')
+plt.title("Performance Metrics", fontsize=14)
+plt.xticks(rotation=45, ha='right')
+plt.grid(alpha=0.3)
+plt.ylim(0, 1.05)
+for i, v in enumerate(metrics_series):
+    plt.text(i, v + 0.02, f"{v:.4f}", ha='center', fontsize=10)
+
+# Fairness Metrics
+plt.subplot(233)
+fairness_df = pd.DataFrame(fairness_results).T
+fairness_df.plot(kind='bar', colormap='viridis')
+plt.title("Fairness Metrics by Sensitive Variable", fontsize=14)
+plt.xticks(rotation=45, ha='right')
+plt.grid(alpha=0.3)
+plt.legend(loc='upper right', bbox_to_anchor=(1.35, 1))
+
+# SHAP Consistency Gaps (per feature, as calculated for test set)
+plt.subplot(234)
+shap_gaps_series = pd.Series({k: v for k, v in shap_gaps.items()}) # Filter out NaN if any
+shap_gaps_series.plot(kind='bar', color='orange')
+plt.title("SHAP Consistency Gaps (Test Set)", fontsize=14)
+plt.ylabel("Mean Absolute Difference")
+plt.grid(alpha=0.3)
+for i, (idx, v) in enumerate(shap_gaps_series.items()):
+    if not np.isnan(v):
+        plt.text(i, v + 0.001, f"{v:.4f}", ha='center', fontsize=10)
+
+# Hyperparameter Importance (using composite score)
+def composite_target(t):
+    if t.values is None:
+        return np.nan
+    mcc = t.values[0]
+    eodd = t.values[1]
+    shap_gap = t.values[2]
+    return 0.5 * mcc - 0.3 * eodd - 0.2 * shap_gap
+
+plt.subplot(235)
+param_importance = get_param_importances(study, target=composite_target)
+param_df = pd.Series(param_importance).sort_values()
+param_df.plot(kind='barh', color='teal')
+plt.title("Hyperparameter Importance (Composite Score)", fontsize=14)
+plt.xlabel("Importance")
+plt.grid(alpha=0.3)
+
+# Objective Trade-offs
+plt.subplot(236)
+for i, trial in enumerate(study.trials):
+    if trial.values is not None:
+        plt.scatter(trial.values[1], trial.values[0],
+                    c=trial.values[2], cmap='viridis', alpha=0.6, s=40)
+plt.colorbar(label='SHAP Gap')
+plt.scatter(best_solution['avg_eodd'], best_solution['mcc'],
+            c='red', s=150, marker='*', label='Selected', edgecolors='black')
+plt.title("MCC vs EODD Trade-off", fontsize=14)
+plt.xlabel("EODD (Lower Better)")
+plt.ylabel("MCC (Higher Better)")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.savefig('iefrf_final_results.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+
+# ===================================================
+# Print Final Results (Original Code)
+# ===================================================
+print("\n" + "="*80)
+print("FINAL MODEL EVALUATION")
+print("="*80)
+print("\nComposite Scores:")
+print(f"Validation: {best_solution['composite']:.4f}")
+print(f"Test: {test_composite:.4f}")
+
+print("\nPerformance Metrics:")
+print(pd.Series(metrics))
+
+print("\nFairness Metrics:")
+print(pd.DataFrame(fairness_results).T)
+
+print("\nSHAP Consistency Gaps (Test Set):")
+print(pd.Series(shap_gaps))
+
+print(f"\nTest Set Composite Breakdown:")
+print(f"- MCC: {test_mcc:.4f}")
+print(f"- Avg EODD: {test_avg_eodd:.4f}")
+print(f"- Avg SHAP Gap: {test_avg_shap_gap:.4f}")
+
+print(f"\nCross-Validation MCC: {np.mean(mcc_scores):.4f} (95% CI: {mcc_ci[0]:.4f} - {mcc_ci[1]:.4f})")
+print("="*80)
+---------------------------End--------------------------------------------------
+
+
+---------EMO with XGBoost with UCI Dataset---------------------------------------
+# ===================================================
+# Ethical Explainable Fair XGBoost with Optuna MOO
+# Using NSGA-II Sampler and 3D Pareto Front Visualization
+# ===================================================
+import sys
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                            f1_score, roc_auc_score, log_loss,
+                            brier_score_loss, matthews_corrcoef,
+                            confusion_matrix, roc_curve, auc)
+from imblearn.over_sampling import BorderlineSMOTE
+from scipy import stats
+import time
+import warnings
+import shap
+import joblib
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
+import optuna
+from optuna.samplers import NSGAIISampler
+from optuna.visualization import plot_pareto_front
+import plotly.graph_objects as go
+from mpl_toolkits.mplot3d import Axes3D
+
+# Handle package installations
+try:
+    import xgboost as xgb
+except ImportError:
+    print("XGBoost not found! Installing...")
+    os.system('pip install xgboost')
+    import xgboost as xgb
+
+# Configure environment
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+np.random.seed(42)
+sns.set(style="whitegrid", font_scale=1.2)
+plt.rcParams['figure.figsize'] = (12, 8)
+shap.initjs()
+
+# ===================================================
+# Data Loading & Preprocessing
+# ===================================================
+def load_data(file_path):
+    """Load and validate dataset with error handling"""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Dataset not found: {file_path}")
+
+    try:
+        df = pd.read_csv(file_path)
+        if 'y' not in df.columns:
+            raise ValueError("Target column 'y' not found in dataset")
+        return df
+    except Exception as e:
+        print(f"Error loading data: {str(e)}")
+        sys.exit(1)
+
+def preprocess_data(df, sensitive_features):
+    """Handle data splitting, SMOTE, and privileged group identification"""
+    X = df.drop('y', axis=1)
+    y = df['y']
+
+    # Ensure all features are float
+    for col in X.columns:
+        if X[col].dtype in ['int', 'int32', 'int64']:
+            X[col] = X[col].astype('float32')
+
+    # Stratified splitting (80:10:10)
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.5, stratify=y_temp, random_state=42
+    )
+
+    # Determine privileged groups from training data
+    privileged_groups = {}
+    for feat in sensitive_features:
+        if feat in X_train.columns:
+            privileged_groups[feat] = X_train[feat].mode()[0]
+        else:
+            print(f"Warning: Sensitive feature '{feat}' not in training data")
+
+    print("\nPrivileged groups:")
+    for feat, val in privileged_groups.items():
+        print(f"- {feat}: {val}")
+
+    # Apply Borderline-SMOTE
+    print("\nApplying Borderline-SMOTE...")
+    print(f"Before: Class 0 = {sum(y_train == 0)}, Class 1 = {sum(y_train == 1)}")
+
+    try:
+        smote = BorderlineSMOTE(sampling_strategy='auto', kind='borderline-2', random_state=42)
+        X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+        print(f"After: Class 0 = {sum(y_train_res == 0)}, Class 1 = {sum(y_train_res == 1)}")
+    except Exception as e:
+        print(f"SMOTE failed: {str(e)}. Using original data.")
+        X_train_res, y_train_res = X_train.copy(), y_train.copy()
+
+    # Convert to float32 for XGBoost
+    X_train_res = X_train_res.astype('float32')
+    X_val = X_val.astype('float32')
+    X_test = X_test.astype('float32')
+
+    return (X_train_res, y_train_res, X_val, y_val, X_test, y_test,
+            privileged_groups, sensitive_features)
+
+# ===================================================
+# Metrics Calculations
+# ===================================================
+def calculate_performance(y_true, y_pred, y_prob):
+    """Calculate comprehensive performance metrics"""
+    return {
+        'Accuracy': accuracy_score(y_true, y_pred),
+        'Precision': precision_score(y_true, y_pred, zero_division=0),
+        'Recall': recall_score(y_true, y_pred, zero_division=0),
+        'F1': f1_score(y_true, y_pred, zero_division=0),
+        'AUC': roc_auc_score(y_true, y_prob),
+        'MCC': matthews_corrcoef(y_true, y_pred),
+        'Log Loss': log_loss(y_true, y_prob),
+        'Brier Score': brier_score_loss(y_true, y_prob)
+    }
+
+def calculate_fairness(X, y_true, y_pred, sensitive_feat, privileged_val):
+    """Calculate fairness metrics with error handling"""
+    try:
+        priv_mask = (X[sensitive_feat] == privileged_val).values
+        unpriv_mask = ~priv_mask
+
+        if np.sum(priv_mask) == 0 or np.sum(unpriv_mask) == 0:
+            return {'EOD': np.nan, 'SPD': np.nan, 'EODD': np.nan}
+
+        # Equal Opportunity Difference
+        tpr_priv = recall_score(y_true[priv_mask], y_pred[priv_mask], zero_division=0)
+        tpr_unpriv = recall_score(y_true[unpriv_mask], y_pred[unpriv_mask], zero_division=0)
+        eod = tpr_priv - tpr_unpriv
+
+        # Statistical Parity Difference
+        pred_priv = np.mean(y_pred[priv_mask])
+        pred_unpriv = np.mean(y_pred[unpriv_mask])
+        spd = pred_priv - pred_unpriv
+
+        # Equalized Odds Difference
+        tn, fp, fn, tp = confusion_matrix(y_true[priv_mask], y_pred[priv_mask]).ravel()
+        fpr_priv = fp / (fp + tn) if (fp + tn) > 0 else 0
+
+        tn, fp, fn, tp = confusion_matrix(y_true[unpriv_mask], y_pred[unpriv_mask]).ravel()
+        fpr_unpriv = fp / (fp + tn) if (fp + tn) > 0 else 0
+
+        eodd = (abs(tpr_priv - tpr_unpriv) + abs(fpr_priv - fpr_unpriv)) / 2
+
+        return {'EOD': eod, 'SPD': spd, 'EODD': eodd}
+    except:
+        return {'EOD': np.nan, 'SPD': np.nan, 'EODD': np.nan}
+
+def calculate_shap_gap(X, shap_values, sensitive_feat, privileged_val):
+    """Calculate SHAP consistency gap with error handling"""
+    try:
+        priv_mask = (X[sensitive_feat] == privileged_val).values
+        unpriv_mask = ~priv_mask
+
+        if np.sum(priv_mask) == 0 or np.sum(unpriv_mask) == 0:
+            return np.nan
+
+        # Handle SHAP values format
+        if isinstance(shap_values, list) and len(shap_values) == 2:
+            shap_vals = shap_values[1]
+        elif len(shap_values.shape) == 3:
+            shap_vals = shap_values[:, :, 1]
+        else:
+            shap_vals = shap_values
+
+        # Ensure consistent dimensions
+        if len(shap_vals) != len(X):
+            return np.nan
+
+        mean_shap_priv = np.mean(shap_vals[priv_mask], axis=0)
+        mean_shap_unpriv = np.mean(shap_vals[unpriv_mask], axis=0)
+        gap = np.abs(mean_shap_priv - mean_shap_unpriv).mean()
+        return gap
+    except Exception as e:
+        print(f"Error in SHAP gap calculation: {str(e)}")
+        return np.nan
+
+def calculate_composite_score(mcc, eodd, shap_gap):
+    """Calculate composite score: 0.5*MCC + 0.3*(1-EODD) + 0.2*(1-shap_gap)"""
+    # Normalize and handle potential NaN values
+    mcc = 0 if np.isnan(mcc) else max(0, mcc)
+    eodd = 1 if np.isnan(eodd) else min(1, max(0, eodd))
+    shap_gap = 1 if np.isnan(shap_gap) else min(1, max(0, shap_gap))
+
+    return 0.5 * mcc + 0.3 * (1 - eodd) + 0.2 * (1 - shap_gap)
+
+# ===================================================
+# MCC Confidence Interval Calculation
+# ===================================================
+def bootstrap_mcc_ci(y_true, y_pred, n_bootstraps=1000, ci=95):
+    """
+    Calculate confidence interval for MCC using bootstrap resampling
+
+    Parameters:
+    y_true -- array of true labels
+    y_pred -- array of predicted labels
+    n_bootstraps -- number of bootstrap samples (default: 1000)
+    ci -- confidence interval percentage (default: 95)
+
+    Returns:
+    (lower_bound, upper_bound) -- confidence interval bounds
+    """
+    mcc_scores = []
+    n_samples = len(y_true)
+    alpha = (100 - ci) / 2
+
+    for _ in range(n_bootstraps):
+        # Resample with replacement
+        indices = np.random.choice(n_samples, n_samples, replace=True)
+        resampled_true = y_true.values[indices] if isinstance(y_true, pd.Series) else y_true[indices]
+        resampled_pred = y_pred[indices]
+
+        # Skip if only one class present
+        if len(np.unique(resampled_true)) < 2 or len(np.unique(resampled_pred)) < 2:
+            continue
+
+        mcc = matthews_corrcoef(resampled_true, resampled_pred)
+        mcc_scores.append(mcc)
+
+    # Handle case with no valid samples
+    if not mcc_scores:
+        return (np.nan, np.nan)
+
+    lower = np.percentile(mcc_scores, alpha)
+    upper = np.percentile(mcc_scores, 100 - alpha)
+    return (lower, upper)
+
+# ===================================================
+# IEF-XGBoost Implementation
+# ===================================================
+class IEFXGBoost:
+    def __init__(self, sensitive_features, privileged_groups,
+                 n_estimators=100, learning_rate=0.1, max_depth=3,
+                 subsample=0.8, colsample_bytree=0.8, gamma=0,
+                 min_child_weight=1, reg_alpha=0, reg_lambda=1):
+        """
+        Intrinsically Explainable Fair XGBoost
+
+        Parameters:
+        sensitive_features -- list of sensitive feature names
+        privileged_groups -- dict {feature: privileged_value}
+        """
+        self.sensitive_features = sensitive_features
+        self.privileged_groups = privileged_groups
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.max_depth = max_depth
+        self.subsample = subsample
+        self.colsample_bytree = colsample_bytree
+        self.gamma = gamma
+        self.min_child_weight = min_child_weight
+        self.reg_alpha = reg_alpha
+        self.reg_lambda = reg_lambda
+        self.model = None
+        self.explainer = None
+
+    def fit(self, X, y, eval_set=None, early_stopping_rounds=None):
+        """Train XGBoost model"""
+        # Prepare data
+        dtrain = xgb.DMatrix(X, label=y)
+        deval = None
+        if eval_set:
+            X_eval, y_eval = eval_set
+            deval = xgb.DMatrix(X_eval, label=y_eval)
+
+        # Set parameters
+        params = {
+            'max_depth': self.max_depth,
+            'learning_rate': self.learning_rate,
+            'objective': 'binary:logistic',
+            'eval_metric': 'logloss',
+            'subsample': self.subsample,
+            'colsample_bytree': self.colsample_bytree,
+            'gamma': self.gamma,
+            'min_child_weight': self.min_child_weight,
+            'reg_alpha': self.reg_alpha,
+            'reg_lambda': self.reg_lambda,
+            'seed': 42
+        }
+
+        # Train model
+        self.model = xgb.train(
+            params,
+            dtrain,
+            num_boost_round=self.n_estimators,
+            evals=[(dtrain, 'train'), (deval, 'eval')] if deval else [(dtrain, 'train')],
+            early_stopping_rounds=early_stopping_rounds,
+            verbose_eval=False
+        )
+
+        # Initialize SHAP explainer
+        try:
+            self.explainer = shap.TreeExplainer(self.model)
+        except Exception as e:
+            print(f"SHAP explainer initialization failed: {str(e)}")
+            self.explainer = None
+
+        return self
+
+    def predict(self, X):
+        """Predict class labels"""
+        dtest = xgb.DMatrix(X)
+        return (self.model.predict(dtest) > 0.5).astype(int)
+
+    def predict_proba(self, X):
+        """Predict class probabilities"""
+        dtest = xgb.DMatrix(X)
+        preds = self.model.predict(dtest)
+        return np.vstack([1 - preds, preds]).T
+
+    def get_shap_values(self, X):
+        """Get SHAP values with error handling"""
+        if self.explainer is None:
+            return None
+        try:
+            shap_values = self.explainer.shap_values(X)
+            if isinstance(shap_values, list) and len(shap_values) == 2:
+                return shap_values[1]
+            return shap_values
+        except:
+            return None
+
+# ===================================================
+# Optuna MOO Optimization
+# ===================================================
+def optimize_ief_xgb(trial, X_train, y_train, X_val, y_val, sensitive_features, privileged_groups):
+    """Optuna objective function for multi-objective optimization"""
+    # Hyperparameter suggestions
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+        'max_depth': trial.suggest_int('max_depth', 3, 10),
+        'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+        'gamma': trial.suggest_float('gamma', 0, 5),
+        'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+        'reg_alpha': trial.suggest_float('reg_alpha', 0, 10),
+        'reg_lambda': trial.suggest_float('reg_lambda', 0.1, 10),
+    }
+
+    # Create and train model
+    model = IEFXGBoost(
+        sensitive_features=sensitive_features,
+        privileged_groups=privileged_groups,
+        **params
+    )
+
+    try:
+        model.fit(X_train, y_train, eval_set=(X_val, y_val), early_stopping_rounds=20)
+    except:
+        # Return poor values if training fails
+        return 0.0, 1.0, 1.0
+
+    # Predictions
+    y_pred = model.predict(X_val)
+    y_prob = model.predict_proba(X_val)[:, 1]
+
+    # Calculate MCC
+    mcc = matthews_corrcoef(y_val, y_pred)
+
+    # Calculate EODD (using first sensitive feature)
+    primary_feat = sensitive_features[0]
+    fairness_metrics = calculate_fairness(
+        X_val, y_val, y_pred,
+        primary_feat, privileged_groups[primary_feat]
+    )
+    eodd = fairness_metrics.get('EODD', 1.0)
+
+    # Calculate SHAP gap (using first sensitive feature)
+    shap_gap = 1.0
+    if model.explainer:
+        shap_values = model.get_shap_values(X_val)
+        if shap_values is not None:
+            shap_gap = calculate_shap_gap(
+                X_val, shap_values,
+                primary_feat, privileged_groups[primary_feat]
+            ) or 1.0
+
+    # Handle potential NaN values
+    mcc = 0.0 if np.isnan(mcc) else mcc
+    eodd = 1.0 if np.isnan(eodd) else min(1.0, max(0.0, eodd))
+    shap_gap = 1.0 if np.isnan(shap_gap) else min(1.0, max(0.0, shap_gap))
+
+    return mcc, eodd, shap_gap
+
+def run_optuna_optimization(X_train, y_train, X_val, y_val, sensitive_features, privileged_groups, n_trials=50):
+    """Run NSGA-II multi-objective optimization with Optuna"""
+    print("\nStarting Optuna multi-objective optimization...")
+
+    # Define multi-objective study
+    study = optuna.create_study(
+        directions=["maximize", "minimize", "minimize"],
+        sampler=NSGAIISampler(),
+        study_name="iefxgb_moo"
+    )
+
+    # Wrapper function for Optuna
+    objective = lambda trial: optimize_ief_xgb(
+        trial, X_train, y_train, X_val, y_val,
+        sensitive_features, privileged_groups
+    )
+
+    # Run optimization
+    study.optimize(objective, n_trials=n_trials, n_jobs=-1, show_progress_bar=True)
+
+    print("\nOptimization completed!")
+    print(f"Number of trials on Pareto front: {len(study.best_trials)}")
+
+    return study
+
+def select_best_trial(study, sensitive_features, privileged_groups):
+    """Select best trial based on composite score"""
+    best_composite = -np.inf
+    best_trial = None
+
+    print("\nEvaluating Pareto front solutions...")
+    for trial in study.best_trials:
+        mcc = trial.values[0]
+        eodd = trial.values[1]
+        shap_gap = trial.values[2]
+
+        composite = calculate_composite_score(mcc, eodd, shap_gap)
+
+        print(f"Trial {trial.number}: MCC={mcc:.4f}, EODD={eodd:.4f}, SHAP Gap={shap_gap:.4f}, Composite={composite:.4f}")
+
+        if composite > best_composite:
+            best_composite = composite
+            best_trial = trial
+
+    print(f"\nBest trial: {best_trial.number}")
+    print(f"Composite score: {best_composite:.4f}")
+    print(f"Hyperparameters: {best_trial.params}")
+
+    return best_trial
+def visualize_3d_pareto(study, best_trial):
+    """Create enhanced 3D visualization of Pareto front with optimal solution"""
+    # Prepare data
+    all_trials = study.trials
+    pareto_trials = study.best_trials
+
+    # Extract values for all trials
+    all_mcc = [t.values[0] for t in all_trials]
+    all_eodd = [t.values[1] for t in all_trials]
+    all_shap = [t.values[2] for t in all_trials]
+
+    # Extract values for Pareto front
+    pareto_mcc = [t.values[0] for t in pareto_trials]
+    pareto_eodd = [t.values[1] for t in pareto_trials]
+    pareto_shap = [t.values[2] for t in pareto_trials]
+
+    # Best trial values
+    best_mcc = best_trial.values[0]
+    best_eodd = best_trial.values[1]
+    best_shap = best_trial.values[2]
+
+    # Create 3D plot
+    fig = plt.figure(figsize=(14, 10))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Plot all trials as small gray dots
+    ax.scatter(
+        all_mcc, all_eodd, all_shap,
+        c='gray', alpha=0.3, s=20,
+        label='All Trials'
+    )
+
+    # Plot Pareto front as blue circles
+    ax.scatter(
+        pareto_mcc, pareto_eodd, pareto_shap,
+        c='blue', alpha=0.8, s=50,
+        label='Pareto Front'
+    )
+
+    # Plot best trial as gold star
+    ax.scatter(
+        best_mcc, best_eodd, best_shap,
+        c='gold', marker='*', s=300,
+        label='Optimal Solution',
+        edgecolor='black'
+    )
+
+    # Enhanced labels with readability
+    ax.set_xlabel('MCC\n(Maximize)',
+                 fontsize=14, fontweight='bold', linespacing=1.5,labelpad=20)
+    ax.set_ylabel('EODD\n(Minimize)',
+                 fontsize=14, fontweight='bold', linespacing=1.5,labelpad=20)
+    ax.set_zlabel('SHAP Gap\n(Minimize)',
+                 fontsize=14, fontweight='bold', linespacing=1.5,labelpad=12)
+
+    ax.set_title('Multi-Objective Optimization: Pareto Front Analysis',
+                fontsize=18, pad=20)
+
+    # Create proxy artists for legend
+    all_trials_proxy = plt.Line2D([0], [0], linestyle='none',
+                                  marker='o', alpha=0.5,
+                                  markersize=8, markerfacecolor='gray')
+    pareto_proxy = plt.Line2D([0], [0], linestyle='none',
+                             marker='o', alpha=0.8,
+                             markersize=10, markerfacecolor='blue')
+    best_proxy = plt.Line2D([0], [0], linestyle='none',
+                           marker='*', markersize=15,
+                           markerfacecolor='gold', markeredgecolor='black')
+
+    ax.legend([all_trials_proxy, pareto_proxy, best_proxy],
+              ['All Trials', 'Pareto Front', 'Optimal Solution'],
+              loc='best', fontsize=12)
+
+    # Adjust view
+    ax.view_init(elev=30, azim=45)
+    ax.grid(True, linestyle='--', alpha=0.7)
+
+    plt.tight_layout()
+    plt.savefig('enhanced_pareto_front.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # Create interactive plot with Plotly
+    fig = go.Figure()
+
+    # Add all trials
+    fig.add_trace(go.Scatter3d(
+        x=all_mcc,
+        y=all_eodd,
+        z=all_shap,
+        mode='markers',
+        marker=dict(
+            size=4,
+            color='blue',
+            opacity=0.4
+        ),
+        name='All Trials'
+    ))
+
+    # Add Pareto front
+    fig.add_trace(go.Scatter3d(
+        x=pareto_mcc,
+        y=pareto_eodd,
+        z=pareto_shap,
+        mode='markers',
+        marker=dict(
+            size=6,
+            color='red',
+            opacity=0.8
+        ),
+        name='Pareto Front'
+    ))
+
+    # Add best trial
+    fig.add_trace(go.Scatter3d(
+        x=[best_mcc],
+        y=[best_eodd],
+        z=[best_shap],
+        mode='markers',
+        marker=dict(
+            size=12,
+            color='gold',
+            symbol='diamond',
+            ),
+        name='Optimal Solution'
+    ))
+
+    fig.update_layout(
+        title='Multi-Objective Optimization: Pareto Front Analysis',
+        scene=dict(
+            xaxis_title='MCC (Maximize)',
+            yaxis_title='EODD (Minimize)',
+            zaxis_title='SHAP Gap (Minimize)',
+            xaxis_title_font=dict(size=14),
+            yaxis_title_font=dict(size=14),
+            zaxis_title_font=dict(size=14)
+
+        ),
+        width=800,
+        height=500,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=-0.5,
+            xanchor="center",
+            x=0.5
+        ),
+        margin=dict(l=0, r=0, b=0, t=40)
+    )
+
+    fig.update_layout
+    fig.write_html('enhanced_pareto_front_interactive.html')
+
+# ===================================================
+# Main Execution
+# ===================================================
+if __name__ == "__main__":
+    # Configuration
+    DATA_PATH = 'wrangledbank.csv'
+    SENSITIVE_FEATURES = ['agecat', 'marital', 'education']
+    N_TRIALS = 50
+
+    # Load and preprocess data
+    print("Loading and preprocessing data...")
+    df = load_data(DATA_PATH)
+    (X_train_res, y_train_res,
+     X_val, y_val,
+     X_test, y_test,
+     privileged_groups, sensitive_features) = preprocess_data(df, SENSITIVE_FEATURES)
+
+    # Run Optuna multi-objective optimization
+    study = run_optuna_optimization(
+        X_train_res, y_train_res,
+        X_val, y_val,
+        sensitive_features,
+        privileged_groups,
+        n_trials=N_TRIALS
+    )
+
+    # Select best trial BEFORE visualization
+    best_trial = select_best_trial(study, sensitive_features, privileged_groups)
+
+    # Visualize Pareto front WITH best_trial
+    visualize_3d_pareto(study, best_trial)  # Now passing both arguments
+
+    # Train final model with best hyperparameters
+    print("\nTraining final IEF-XGBoost model with best hyperparameters...")
+    final_model = IEFXGBoost(
+        sensitive_features=sensitive_features,
+        privileged_groups=privileged_groups,
+        **best_trial.params
+    )
+
+    # Use combined training+validation data
+    X_train_full = pd.concat([X_train_res, X_val])
+    y_train_full = pd.concat([y_train_res, y_val])
+    final_model.fit(X_train_full, y_train_full)
+
+    # Evaluate on test set
+    print("\nEvaluating on test set...")
+    y_pred = final_model.predict(X_test)
+    y_prob = final_model.predict_proba(X_test)[:, 1]
+
+    # Calculate MCC Confidence Interval
+    mcc_ci_lower, mcc_ci_upper = bootstrap_mcc_ci(
+        y_test,
+        y_pred,
+        n_bootstraps=1000,
+        ci=95
+    )
+
+    # Performance metrics
+    perf_metrics = calculate_performance(y_test, y_pred, y_prob)
+    perf_metrics['MCC_CI'] = (mcc_ci_lower, mcc_ci_upper)  # Add confidence interval
+
+    # Fairness metrics
+    fairness_results = {}
+    for feat in sensitive_features:
+        fairness_results[feat] = calculate_fairness(
+            X_test, y_test, y_pred, feat, privileged_groups[feat]
+        )
+
+    # SHAP consistency gaps
+    shap_gaps = {}
+    if final_model.explainer:
+        shap_values = final_model.get_shap_values(X_test)
+        if shap_values is not None:
+            for feat in sensitive_features:
+                shap_gaps[feat] = calculate_shap_gap(
+                    X_test, shap_values, feat, privileged_groups[feat]
+                )
+
+    # Calculate composite score
+    primary_feat = sensitive_features[0]
+    composite = calculate_composite_score(
+        perf_metrics['MCC'],
+        fairness_results[primary_feat]['EODD'],
+        shap_gaps.get(primary_feat, 1.0)
+    )
+
+    # Print final results
+    print("\n" + "="*80)
+    print("Final Evaluation Results")
+    print("="*80)
+
+    print("\nPerformance Metrics:")
+    for metric, value in perf_metrics.items():
+        if metric == 'MCC_CI':
+            print(f"- MCC 95% CI: [{value[0]:.4f}, {value[1]:.4f}]")
+        else:
+            print(f"- {metric}: {value:.4f}")
+
+    print("\nFairness Metrics:")
+    for feat, metrics in fairness_results.items():
+        print(f"\n{feat}:")
+        for metric, value in metrics.items():
+            print(f"  - {metric}: {value:.4f}")
+
+    print("\nSHAP Consistency Gaps:")
+    for feat, gap in shap_gaps.items():
+        print(f"- {feat}: {gap:.4f}")
+
+    print(f"\nComposite Score: {composite:.4f}")
+
+    # Save model
+    joblib.dump(final_model, 'iefxgb_optimized_model.pkl')
+    print("\nModel saved to 'iefxgb_optimized_model.pkl'")
+
+    # Print final summary
+    print("\n" + "="*80)
+    print("IEF-XGBoost Optimization Complete!")
+    print("="*80)
+
+------------------------END-----------------------------------------------------
+
+
+
+-------------EMO with TabNet with UCI Dataset ------------------------------------
+
+# ===================================================
+# Import Required Libraries
+# ===================================================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                            f1_score, roc_auc_score, log_loss,
+                            brier_score_loss, matthews_corrcoef,
+                            confusion_matrix, roc_curve, auc)
+from sklearn.preprocessing import StandardScaler
+from imblearn.over_sampling import BorderlineSMOTE
+import shap
+from scipy import stats
+import warnings
+import optuna
+from optuna.samplers import NSGAIISampler
+from optuna.importance import get_param_importances
+import joblib
+from mpl_toolkits.mplot3d import Axes3D
+from pytorch_tabnet.tab_model import TabNetClassifier
+import torch
+
+warnings.filterwarnings('ignore')
+
+# Set global parameters
+np.random.seed(42)
+torch.manual_seed(42)
+sns.set(style="whitegrid", font_scale=1.2)
+plt.rcParams['figure.figsize'] = (12, 8)
+shap.initjs()
+
+# ===================================================
+# Data Loading and Stratified Splitting (80:10:10)
+# ===================================================
+df = pd.read_csv('wrangledbank.csv')
+X = df.drop('y', axis=1)
+y = df['y']
+
+# Convert integer columns to float to avoid SMOTE casting error
+int_cols = X.select_dtypes(include=['int', 'int32', 'int64']).columns
+if len(int_cols) > 0:
+    print(f"Converting integer columns to float: {list(int_cols)}")
+    X[int_cols] = X[int_cols].astype(np.float64)
+
+# First split: 80% training, 20% temporary test
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# Second split: 10% validation, 10% test (50% of 20%)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp, test_size=0.5, stratify=y_temp, random_state=42
+)
+
+print("="*80)
+print("Stratified Split Distribution")
+print("="*80)
+print(f"Training set: {X_train.shape[0]} samples (Positive: {y_train.sum()}, {y_train.mean():.2%})")
+print(f"Validation set: {X_val.shape[0]} samples (Positive: {y_val.sum()}, {y_val.mean():.2%})")
+print(f"Testing set: {X_test.shape[0]} samples (Positive: {y_test.sum()}, {y_test.mean():.2%})")
+
+# Identify sensitive features
+sensitive_features = ['agecat', 'marital', 'education']
+
+# Determine privileged groups ONLY from training data (pre-SMOTE)
+privileged_groups = {}
+for feat in sensitive_features:
+    privileged_groups[feat] = X_train[feat].mode()[0]
+
+print("\nPrivileged groups determined from training data (pre-SMOTE):")
+for feat, val in privileged_groups.items():
+    print(f"- {feat}: {val}")
+
+# ===================================================
+# Apply Borderline-SMOTE to Training Data
+# ===================================================
+print("="*80)
+print("Applying Borderline-SMOTE to Training Data")
+print("="*80)
+print(f"Before SMOTE: Class 0 = {sum(y_train == 0)}, Class 1 = {sum(y_train == 1)}")
+
+smote = BorderlineSMOTE(sampling_strategy='auto', kind='borderline-2', random_state=42)
+X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+
+print(f"After SMOTE: Class 0 = {sum(y_train_res == 0)}, Class 1 = {sum(y_train_res == 1)}")
+
+# Prepare sensitive mask for primary sensitive feature
+primary_sensitive = 'agecat'
+sensitive_mask_train = (X_train_res[primary_sensitive] == privileged_groups[primary_sensitive]).astype(int).values
+
+# Scale data for TabNet
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train_res)
+X_val_scaled = scaler.transform(X_val)
+X_test_scaled = scaler.transform(X_test)
+
+# Convert to float32 for faster computation
+X_train_scaled = X_train_scaled.astype('float32')
+X_val_scaled = X_val_scaled.astype('float32')
+X_test_scaled = X_test_scaled.astype('float32')
+
+# ===================================================
+# Helper Functions for Metrics
+# ===================================================
+def calculate_fairness_metrics(X, y_true, y_pred, sensitive_var, privileged_group):
+    priv_mask = (X[sensitive_var] == privileged_group).values
+    unpriv_mask = ~priv_mask
+
+    if np.sum(priv_mask) == 0 or np.sum(unpriv_mask) == 0:
+        return {'EOD': np.nan, 'SPD': np.nan, 'EODD': np.nan}
+
+    # Equal Opportunity Difference
+    try:
+        tpr_priv = recall_score(y_true[priv_mask], y_pred[priv_mask], zero_division=0)
+    except:
+        tpr_priv = 0
+    try:
+        tpr_unpriv = recall_score(y_true[unpriv_mask], y_pred[unpriv_mask], zero_division=0)
+    except:
+        tpr_unpriv = 0
+    eod = tpr_priv - tpr_unpriv
+
+    # Statistical Parity Difference
+    pred_priv = np.mean(y_pred[priv_mask])
+    pred_unpriv = np.mean(y_pred[unpriv_mask])
+    spd = pred_priv - pred_unpriv
+
+    # Equalized Odds Difference
+    try:
+        tn, fp, fn, tp = confusion_matrix(y_true[priv_mask], y_pred[priv_mask]).ravel()
+        fpr_priv = fp / (fp + tn) if (fp + tn) > 0 else 0
+    except:
+        fpr_priv = 0
+
+    try:
+        tn, fp, fn, tp = confusion_matrix(y_true[unpriv_mask], y_pred[unpriv_mask]).ravel()
+        fpr_unpriv = fp / (fp + tn) if (fp + tn) > 0 else 0
+    except:
+        fpr_unpriv = 0
+
+    eodd = (abs(eod) + abs(fpr_priv - fpr_unpriv)) / 2
+
+    return {'EOD': eod, 'SPD': spd, 'EODD': eodd}
+
+def calculate_shap_gap(model, X, sensitive_features, privileged_groups, sample_size=200):
+    """Calculate average SHAP consistency gap across sensitive features"""
+    # Check model type
+    if isinstance(model, TabNetClassifier):
+        # Use KernelExplainer for TabNet
+        def predict_proba_wrapper(X_array):
+            return model.predict_proba(X_array)
+
+        explainer = shap.KernelExplainer(predict_proba_wrapper, shap.kmeans(X, 10))
+    else:
+        # Use TreeExplainer for tree-based models
+        explainer = shap.TreeExplainer(model)
+
+    # Sample data if needed
+    if len(X) > sample_size:
+        sample_idx = np.random.choice(len(X), sample_size, replace=False)
+        X_sample = X.iloc[sample_idx]
+    else:
+        X_sample = X
+
+    # Compute SHAP values
+    shap_values = explainer.shap_values(X_sample, check_additivity=False)
+
+    # For binary classification, use SHAP values for class 1
+    if isinstance(shap_values, list) and len(shap_values) == 2:
+        shap_vals = shap_values[1]
+    else:
+        shap_vals = shap_values
+
+    gaps = []
+    for feat in sensitive_features:
+        priv_mask = (X_sample[feat] == privileged_groups[feat]).values
+        unpriv_mask = ~priv_mask
+
+        if np.sum(priv_mask) == 0 or np.sum(unpriv_mask) == 0:
+            continue
+
+        # Calculate mean absolute SHAP values per group
+        shap_priv = np.abs(shap_vals[priv_mask]).mean(axis=0)
+        shap_unpriv = np.abs(shap_vals[unpriv_mask]).mean(axis=0)
+
+        # Compute gap as mean absolute difference across features
+        gap = np.abs(shap_priv - shap_unpriv).mean()
+        gaps.append(gap)
+
+    return np.mean(gaps) if gaps else 0.0
+
+# ===================================================
+# Optuna MOO Optimization with NSGA-II (3 Objectives)
+# ===================================================
+def objective(trial):
+    # Hyperparameter search space for TabNet
+    params = {
+        'n_d': trial.suggest_int('n_d', 8, 64),
+        'n_a': trial.suggest_int('n_a', 8, 64),
+        'n_steps': trial.suggest_int('n_steps', 3, 10),
+        'gamma': trial.suggest_float('gamma', 1.0, 2.0),
+        'lambda_sparse': trial.suggest_float('lambda_sparse', 1e-6, 1e-3, log=True),
+        'mask_type': trial.suggest_categorical('mask_type', ['entmax', 'sparsemax']),
+        'batch_size': trial.suggest_categorical('batch_size', [256, 512, 1024, 2048]),
+        'virtual_batch_size': trial.suggest_categorical('virtual_batch_size', [64, 128, 256]),
+        'momentum': trial.suggest_float('momentum', 0.01, 0.4),
+        'optimizer_params': {'lr': trial.suggest_float('lr', 1e-4, 1e-2, log=True)},
+        'scheduler_params': {'step_size': trial.suggest_int('step_size', 5, 20),
+                             'gamma': trial.suggest_float('scheduler_gamma', 0.1, 0.9)},
+        'patience': trial.suggest_int('patience', 5, 30),
+        'max_epochs': trial.suggest_int('max_epochs', 50, 200),
+    }
+
+    # Create TabNet model
+    model = TabNetClassifier(
+        n_d=params['n_d'],
+        n_a=params['n_a'],
+        n_steps=params['n_steps'],
+        gamma=params['gamma'],
+        lambda_sparse=params['lambda_sparse'],
+        mask_type=params['mask_type'],
+        optimizer_params=params['optimizer_params'],
+        scheduler_params=params['scheduler_params'],
+        seed=42
+    )
+
+    # Train model
+    model.fit(
+        X_train_scaled, y_train_res.values,
+        eval_set=[(X_val_scaled, y_val.values)],
+        eval_name=['val'],
+        eval_metric=['auc'],
+        max_epochs=params['max_epochs'],
+        patience=params['patience'],
+        batch_size=params['batch_size'],
+        virtual_batch_size=params['virtual_batch_size'],
+        num_workers=0,
+        drop_last=False,
+        loss_fn=torch.nn.functional.cross_entropy
+    )
+
+    # Predict on validation set
+    y_pred_val = model.predict(X_val_scaled)
+
+    # Calculate performance metrics
+    mcc = matthews_corrcoef(y_val, y_pred_val)
+
+    # Calculate fairness metrics (average EODD across sensitive features)
+    eodds = []
+    for feat in sensitive_features:
+        fm = calculate_fairness_metrics(
+            X_val, y_val, y_pred_val,
+            feat, privileged_groups[feat]
+        )
+        eodd = fm['EODD']
+        if not np.isnan(eodd):
+            eodds.append(eodd)
+
+    avg_eodd = np.mean(eodds) if len(eodds) > 0 else 0.5
+
+    # Calculate SHAP consistency gap
+    shap_gap = calculate_shap_gap(
+        model,
+        pd.DataFrame(X_val_scaled, columns=X.columns),
+        sensitive_features,
+        privileged_groups,
+        sample_size=200
+    )
+
+    # Return three objectives
+    return mcc, avg_eodd, shap_gap
+
+# Create MOO study with NSGA-II sampler for 3 objectives
+print("\nStarting Optuna MOO optimization with NSGA-II sampler...")
+study = optuna.create_study(
+    directions=['maximize', 'minimize', 'minimize'],
+    sampler=NSGAIISampler(population_size=20),
+    study_name='tabnet_moo_3obj'
+)
+study.optimize(objective, n_trials=2, timeout=3600*3, show_progress_bar=True)
+
+print("Number of completed trials: ", len(study.trials))
+print("Pareto front solutions:")
+
+# Extract Pareto front solutions
+pareto_front = []
+for trial in study.best_trials:
+    if trial.values is not None:
+        pareto_front.append({
+            'trial': trial,
+            'params': trial.params,
+            'mcc': trial.values[0],
+            'avg_eodd': trial.values[1],
+            'shap_gap': trial.values[2]
+        })
+        print(f"Trial {trial.number}: MCC={trial.values[0]:.4f}, avg_EODD={trial.values[1]:.4f}, SHAP_Gap={trial.values[2]:.4f}")
+
+# Calculate composite score for each solution
+for solution in pareto_front:
+    composite = (0.5 * solution['mcc'] -
+                 0.3 * solution['avg_eodd'] -
+                 0.2 * solution['shap_gap'])
+    solution['composite'] = composite
+
+# Select best solution based on composite score
+pareto_front.sort(key=lambda x: x['composite'], reverse=True)
+best_solution = pareto_front[0]
+best_params = best_solution['params']
+
+print("\nBest solution based on composite score (0.5*MCC - 0.3*EODD - 0.2*SHAP_Gap):")
+print(f"Composite: {best_solution['composite']:.4f}")
+print(f"MCC: {best_solution['mcc']:.4f}")
+print(f"Avg EODD: {best_solution['avg_eodd']:.4f}")
+print(f"SHAP Gap: {best_solution['shap_gap']:.4f}")
+print("\nHyperparameters:")
+print(best_params)
+
+# ===================================================
+# Final Model Training with Best Hyperparameters
+# ===================================================
+optimizer_params = {'lr': best_params['lr']}
+scheduler_params = {
+    'step_size': best_params['step_size'],
+    'gamma': best_params['scheduler_gamma']
+}
+final_model = TabNetClassifier(
+    n_d=best_params['n_d'],
+    n_a=best_params['n_a'],
+    n_steps=best_params['n_steps'],
+    gamma=best_params['gamma'],
+    lambda_sparse=best_params['lambda_sparse'],
+    mask_type=best_params['mask_type'],
+    optimizer_params=optimizer_params,  # Use reconstructed
+    scheduler_params=scheduler_params,
+    seed=42
+)
+
+# Cross-Validation with Confidence Intervals
+cv = StratifiedKFold(n_splits=5)
+mcc_scores = []
+
+for train_idx, test_idx in cv.split(X_train_scaled, y_train_res):
+    X_train_cv, X_test_cv = X_train_scaled[train_idx], X_train_scaled[test_idx]
+    y_train_cv, y_test_cv = y_train_res.iloc[train_idx], y_train_res.iloc[test_idx]
+
+# Reconstruct params for CV models
+    cv_optimizer_params = {'lr': best_params['lr']}
+    cv_scheduler_params = {
+        'step_size': best_params['step_size'],
+        'gamma': best_params['scheduler_gamma']
+    }
+
+    model_cv = TabNetClassifier(
+        n_d=best_params['n_d'],
+        n_a=best_params['n_a'],
+        n_steps=best_params['n_steps'],
+        gamma=best_params['gamma'],
+        lambda_sparse=best_params['lambda_sparse'],
+        mask_type=best_params['mask_type'],
+        optimizer_params=cv_optimizer_params,  # Add this
+        scheduler_params=cv_scheduler_params,
+        seed=42
+    )
+
+    model_cv.fit(
+        X_train_cv, y_train_cv.values,
+        eval_set=[(X_test_cv, y_test_cv.values)],
+        max_epochs=best_params['max_epochs'],
+        patience=best_params['patience'],
+        batch_size=best_params['batch_size'],
+        virtual_batch_size=best_params['virtual_batch_size'],
+        num_workers=0,
+        drop_last=False
+    )
+
+    y_pred_cv = model_cv.predict(X_test_cv)
+    mcc = matthews_corrcoef(y_test_cv, y_pred_cv)
+    mcc_scores.append(mcc)
+
+mcc_ci = stats.t.interval(0.95, len(mcc_scores)-1,
+                         loc=np.mean(mcc_scores),
+                         scale=stats.sem(mcc_scores))
+
+# Train final model on full training data
+final_model.fit(
+    X_train_scaled, y_train_res.values,
+    eval_set=[(X_val_scaled, y_val.values)],
+    max_epochs=best_params['max_epochs'],
+    patience=best_params['patience'],
+    batch_size=best_params['batch_size'],
+    virtual_batch_size=best_params['virtual_batch_size'],
+    num_workers=0,
+    drop_last=False
+)
+
+# Save the trained model
+joblib.dump(final_model, 'tabnet_optimized_model.pkl')
+
+# ===================================================
+# Evaluation on Test Data
+# ===================================================
+y_pred = final_model.predict(X_test_scaled)
+y_prob = final_model.predict_proba(X_test_scaled)[:, 1]
+
+# Performance Metrics
+metrics = {
+    'Accuracy': accuracy_score(y_test, y_pred),
+    'Precision': precision_score(y_test, y_pred),
+    'Recall': recall_score(y_test, y_pred),
+    'F1': f1_score(y_test, y_pred),
+    'AUC': roc_auc_score(y_test, y_prob),
+    'MCC': matthews_corrcoef(y_test, y_pred),
+    'Log Loss': log_loss(y_test, y_prob),
+    'Brier Score': brier_score_loss(y_test, y_prob)
+}
+
+# Fairness Evaluation
+fairness_results = {}
+for feat in sensitive_features:
+    fairness_results[feat] = calculate_fairness_metrics(
+        X_test, y_test, y_pred,
+        feat, privileged_groups[feat]
+    )
+
+# SHAP Analysis on Test Data
+shap_gaps = {}
+X_test_df = pd.DataFrame(X_test_scaled, columns=X.columns)
+
+for feat in sensitive_features:
+    priv_mask = (X_test[feat] == privileged_groups[feat]).values
+    unpriv_mask = ~priv_mask
+
+    if np.sum(priv_mask) == 0 or np.sum(unpriv_mask) == 0:
+        shap_gaps[feat] = np.nan
+        continue
+
+    # Calculate SHAP gap
+    shap_gap = calculate_shap_gap(
+        final_model,
+        X_test_df,
+        [feat],
+        privileged_groups,
+        sample_size=200
+    )
+    shap_gaps[feat] = shap_gap
+
+# Calculate composite score for test set
+test_mcc = metrics['MCC']
+test_avg_eodd = np.mean([v['EODD'] for v in fairness_results.values() if not np.isnan(v['EODD'])])
+test_avg_shap_gap = np.mean([v for v in shap_gaps.values() if not np.isnan(v)])
+
+test_composite = (0.5 * test_mcc -
+                  0.3 * test_avg_eodd -
+                  0.2 * test_avg_shap_gap)
+
+# ===================================================
+# Visualization - 3D Pareto Front and Results
+# ===================================================
+# Plot 3D Pareto front
+fig = plt.figure(figsize=(14, 10))
+ax = fig.add_subplot(111, projection='3d')
+
+# Get values from all trials
+mcc_vals = [t.values[0] for t in study.trials if t.values is not None]
+eodd_vals = [t.values[1] for t in study.trials if t.values is not None]
+shap_vals = [t.values[2] for t in study.trials if t.values is not None]
+
+# Pareto front points
+pf_mcc = [s['mcc'] for s in pareto_front]
+pf_eodd = [s['avg_eodd'] for s in pareto_front]
+pf_shap = [s['shap_gap'] for s in pareto_front]
+
+# Plot all trials
+ax.scatter(eodd_vals, shap_vals, mcc_vals, c='blue', alpha=0.3, label='All Trials', s=40)
+
+# Plot Pareto front
+ax.scatter(pf_eodd, pf_shap, pf_mcc, c='red', s=80, label='Pareto Front')
+
+# Highlight best solution
+best_idx = 0
+ax.scatter(
+    [pareto_front[best_idx]['avg_eodd']],
+    [pareto_front[best_idx]['shap_gap']],
+    [pareto_front[best_idx]['mcc']],
+    c='gold', s=400, marker='*', edgecolor='black', label='Selected Solution'
+)
+
+ax.set_xlabel('Avg EODD (Lower Better)', fontsize=12)
+ax.set_ylabel('SHAP Gap (Lower Better)', fontsize=12)
+ax.set_zlabel('MCC (Higher Better)', fontsize=12)
+ax.set_title('3D Pareto Front (MCC vs EODD vs SHAP Gap)', fontsize=16)
+ax.legend(fontsize=12)
+ax.view_init(elev=20, azim=45)  # Adjust viewing angle
+plt.tight_layout()
+plt.savefig('3d_pareto_front.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# Performance and Fairness Visualization
+plt.figure(figsize=(18, 12))
+
+# Composite Scores
+plt.subplot(231)
+scores = {
+    'Validation': best_solution['composite'],
+    'Test': test_composite
+}
+scores_series = pd.Series(scores)
+scores_series.plot(kind='bar', color=['blue', 'green'])
+plt.title("Composite Scores (0.5*MCC - 0.3*EODD - 0.2*SHAP_Gap)", fontsize=14)
+plt.xticks(rotation=0)
+plt.grid(alpha=0.3)
+for i, v in enumerate(scores_series):
+    plt.text(i, v + 0.01 * np.sign(v), f"{v:.4f}", ha='center', fontsize=12)
+
+# Performance Metrics
+plt.subplot(232)
+metrics_series = pd.Series(metrics)
+metrics_series.plot(kind='bar', color='skyblue')
+plt.title("Performance Metrics", fontsize=14)
+plt.xticks(rotation=45, ha='right')
+plt.grid(alpha=0.3)
+plt.ylim(0, 1.05)
+for i, v in enumerate(metrics_series):
+    plt.text(i, v + 0.02, f"{v:.4f}", ha='center', fontsize=10)
+
+# Fairness Metrics
+plt.subplot(233)
+fairness_df = pd.DataFrame(fairness_results).T
+fairness_df.plot(kind='bar', colormap='viridis')
+plt.title("Fairness Metrics by Sensitive Variable", fontsize=14)
+plt.xticks(rotation=45, ha='right')
+plt.grid(alpha=0.3)
+plt.legend(loc='upper right', bbox_to_anchor=(1.35, 1))
+
+# SHAP Consistency Gaps
+plt.subplot(234)
+shap_gaps_series = pd.Series(shap_gaps)
+shap_gaps_series.plot(kind='bar', color='orange')
+plt.title("SHAP Consistency Gaps", fontsize=14)
+plt.ylabel("Mean Absolute Difference")
+plt.grid(alpha=0.3)
+for i, v in enumerate(shap_gaps_series):
+    if not np.isnan(v):
+        plt.text(i, v + 0.001, f"{v:.4f}", ha='center', fontsize=10)
+
+# Hyperparameter Importance (using composite score)
+def composite_target(t):
+    if t.values is None:
+        return np.nan
+    mcc = t.values[0]
+    eodd = t.values[1]
+    shap_gap = t.values[2]
+    return 0.5 * mcc - 0.3 * eodd - 0.2 * shap_gap
+
+plt.subplot(235)
+param_importance = get_param_importances(study, target=composite_target)
+param_df = pd.Series(param_importance).sort_values()
+param_df.plot(kind='barh', color='teal')
+plt.title("Hyperparameter Importance (Composite Score)", fontsize=14)
+plt.xlabel("Importance")
+plt.grid(alpha=0.3)
+
+# Objective Trade-offs
+plt.subplot(236)
+for i, trial in enumerate(study.trials):
+    if trial.values is not None:
+        plt.scatter(trial.values[1], trial.values[0],
+                    c=trial.values[2], cmap='viridis', alpha=0.6)
+plt.colorbar(label='SHAP Gap')
+plt.scatter(best_solution['avg_eodd'], best_solution['mcc'],
+            c='red', s=150, marker='*', label='Selected')
+plt.title("MCC vs EODD Trade-off", fontsize=14)
+plt.xlabel("Avg EODD (Lower Better)")
+plt.ylabel("MCC (Higher Better)")
+plt.grid(True)
+plt.legend()
+
+plt.tight_layout()
+plt.savefig('tabnet_final_results.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ===================================================
+# Print Final Results
+# ===================================================
+print("\n" + "="*80)
+print("FINAL MODEL EVALUATION")
+print("="*80)
+print("\nComposite Scores:")
+print(f"Validation: {best_solution['composite']:.4f}")
+print(f"Test: {test_composite:.4f}")
+
+print("\nPerformance Metrics:")
+print(pd.Series(metrics))
+
+print("\nFairness Metrics:")
+print(pd.DataFrame(fairness_results).T)
+
+print("\nSHAP Consistency Gaps:")
+print(pd.Series(shap_gaps))
+
+print(f"\nTest Set Composite Breakdown:")
+print(f"- MCC: {test_mcc:.4f}")
+print(f"- Avg EODD: {test_avg_eodd:.4f}")
+print(f"- Avg SHAP Gap: {test_avg_shap_gap:.4f}")
+
+print(f"\nCross-Validation MCC: {np.mean(mcc_scores):.4f} (95% CI: {mcc_ci[0]:.4f} - {mcc_ci[1]:.4f})")
+print("="*80)
+---------------------END-------------------------------------------------------

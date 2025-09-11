@@ -1,0 +1,3453 @@
+--------MOO for RF-----------------------------------
+# ===================================================
+# Import Required Libraries
+# ===================================================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                            f1_score, roc_auc_score, log_loss,
+                            brier_score_loss, matthews_corrcoef,
+                            confusion_matrix, roc_curve, auc)
+from imblearn.over_sampling import BorderlineSMOTE
+import shap
+from scipy import stats
+import warnings
+import optuna
+from optuna.samplers import NSGAIISampler
+from sklearn.metrics.pairwise import cosine_similarity
+from mpl_toolkits.mplot3d import Axes3D  # For 3D plotting
+
+warnings.filterwarnings('ignore')
+
+# Set global parameters
+np.random.seed(42)
+sns.set(style="whitegrid", font_scale=1.2)
+plt.rcParams['figure.figsize'] = (12, 8)
+shap.initjs()
+
+# ===================================================
+# Data Loading and Stratified Splitting (80:10:10)
+# ===================================================
+# Load dataset
+df = pd.read_csv('wrangledbank.csv')
+X = df.drop('y', axis=1)
+y = df['y']
+
+# Convert integer columns to float to avoid SMOTE casting error
+int_cols = X.select_dtypes(include=['int', 'int32', 'int64']).columns
+if len(int_cols) > 0:
+    print(f"Converting integer columns to float: {list(int_cols)}")
+    X[int_cols] = X[int_cols].astype(np.float64)
+
+# First split: 80% training, 20% temporary test
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# Second split: 10% validation, 10% test (50% of 20%)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp, test_size=0.5, stratify=y_temp, random_state=42
+)
+
+print("="*80)
+print("Stratified Split Distribution")
+print("="*80)
+print(f"Training set: {X_train.shape[0]} samples (Positive: {y_train.sum()}, {y_train.mean():.2%})")
+print(f"Validation set: {X_val.shape[0]} samples (Positive: {y_val.sum()}, {y_val.mean():.2%})")
+print(f"Testing set: {X_test.shape[0]} samples (Positive: {y_test.sum()}, {y_test.mean():.2%})")
+
+# Identify sensitive features
+sensitive_features = ['agecat', 'marital', 'education']
+
+# Determine privileged groups from training data
+privileged_groups_train = {}
+for feat in sensitive_features:
+    privileged_groups_train[feat] = X_train[feat].mode()[0]
+
+# Determine privileged groups from test data
+privileged_groups_test = {}
+for feat in sensitive_features:
+    privileged_groups_test[feat] = X_test[feat].mode()[0]
+
+print("\nPrivileged groups determined from training data:")
+for feat, val in privileged_groups_train.items():
+    print(f"- {feat}: {val}")
+
+print("\nPrivileged groups determined from test data:")
+for feat, val in privileged_groups_test.items():
+    print(f"- {feat}: {val}")
+
+# ===================================================
+# Apply Borderline-SMOTE to Training Data (FIXED)
+# ===================================================
+print("="*80)
+print("Applying Borderline-SMOTE to Training Data")
+print("="*80)
+print(f"Before SMOTE: Class 0 = {sum(y_train == 0)}, Class 1 = {sum(y_train == 1)}")
+
+# Store pre-SMOTE privileged groups and distributions
+pre_smote_privileged = privileged_groups_train.copy()
+pre_smote_distributions = {}
+for feat in sensitive_features:
+    pre_smote_distributions[feat] = X_train[feat].value_counts(normalize=True).to_dict()
+
+smote = BorderlineSMOTE(sampling_strategy='auto', kind='borderline-2', random_state=42)
+X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+
+# Convert back to DataFrame with proper column names and data types (CRITICAL FIX)
+X_train_res = pd.DataFrame(X_train_res, columns=X_train.columns)
+for col in X_train.columns:
+    X_train_res[col] = X_train_res[col].astype(X_train[col].dtype)
+
+print(f"After SMOTE: Class 0 = {sum(y_train_res == 0)}, Class 1 = {sum(y_train_res == 1)}")
+
+# ===================================================
+# Comparative Analysis: Privileged Groups Before/After SMOTE (FIXED)
+# ===================================================
+print("="*80)
+print("Privileged Group Analysis: Before vs After SMOTE")
+print("="*80)
+
+# Determine privileged groups from resampled data
+post_smote_privileged = {}
+post_smote_distributions = {}
+for feat in sensitive_features:
+    # Get the most frequent category in resampled data
+    post_smote_privileged[feat] = X_train_res[feat].mode()[0]
+    # Get distribution
+    post_smote_distributions[feat] = X_train_res[feat].value_counts(normalize=True).to_dict()
+
+# Create comparison table
+comparison_data = []
+for feat in sensitive_features:
+    pre_mode = pre_smote_privileged[feat]
+    post_mode = post_smote_privileged[feat]
+    changed = "YES" if pre_mode != post_mode else "NO"
+
+    # Calculate bias change metrics
+    pre_rep = pre_smote_distributions[feat].get(pre_mode, 0)
+    post_rep = post_smote_distributions[feat].get(post_mode, 0)
+    rep_change = post_rep - pre_rep
+
+    # Calculate Gini coefficient for bias measurement
+    def gini_coeff(values):
+        sorted_vals = np.sort(np.array(list(values)))
+        n = len(sorted_vals)
+        index = np.arange(1, n+1)
+        return (np.sum((2 * index - n - 1) * sorted_vals)) / (n * np.sum(sorted_vals))
+
+    pre_gini = gini_coeff(list(pre_smote_distributions[feat].values()))
+    post_gini = gini_coeff(list(post_smote_distributions[feat].values()))
+    gini_change = post_gini - pre_gini
+
+    comparison_data.append({
+        'Feature': feat,
+        'Pre-SMOTE Privileged': pre_mode,
+        'Post-SMOTE Privileged': post_mode,
+        'Changed': changed,
+        'Pre-SMOTE Representation': f"{pre_rep:.2%}",
+        'Post-SMOTE Representation': f"{post_rep:.2%}",
+        'Representation Change': f"{rep_change:+.2f}",
+        'Pre-SMOTE Gini': f"{pre_gini:.4f}",
+        'Post-SMOTE Gini': f"{post_gini:.4f}",
+        'Gini Change': f"{gini_change:+.4f}",
+        'Bias Status': "Reduced" if gini_change < 0 else "Increased"
+    })
+
+# Create and display comparison DataFrame
+comparison_df = pd.DataFrame(comparison_data)
+print("\nPrivileged Group Comparison:")
+print(comparison_df.to_string(index=False))
+
+# Visualization: Distribution changes (FIXED)
+fig, axes = plt.subplots(len(sensitive_features), 2, figsize=(16, 6*len(sensitive_features)))
+for i, feat in enumerate(sensitive_features):
+    # Pre-SMOTE distribution
+    ax1 = axes[i, 0] if len(sensitive_features) > 1 else axes[0]
+    pre_dist = pre_smote_distributions[feat]
+    pre_categories = list(pre_dist.keys())
+    pre_values = list(pre_dist.values())
+    sns.barplot(x=pre_categories, y=pre_values, ax=ax1, palette='viridis')
+    ax1.axhline(y=1/len(pre_dist), color='r', linestyle='--', alpha=0.7)
+    ax1.set_title(f'Pre-SMOTE Distribution: {feat}\nPrivileged: {pre_smote_privileged[feat]}')
+    ax1.set_ylim(0, 1)
+    ax1.tick_params(axis='x', rotation=45)
+
+    # Post-SMOTE distribution
+    ax2 = axes[i, 1] if len(sensitive_features) > 1 else axes[1]
+    post_dist = post_smote_distributions[feat]
+    post_categories = list(post_dist.keys())
+    post_values = list(post_dist.values())
+    sns.barplot(x=post_categories, y=post_values, ax=ax2, palette='viridis')
+    ax2.axhline(y=1/len(post_dist), color='r', linestyle='--', alpha=0.7)
+    ax2.set_title(f'Post-SMOTE Distribution: {feat}\nPrivileged: {post_smote_privileged[feat]}')
+    ax2.set_ylim(0, 1)
+    ax2.tick_params(axis='x', rotation=45)
+
+plt.tight_layout()
+plt.suptitle('Sensitive Feature Distribution: Before vs After SMOTE', y=1.02, fontsize=16)
+plt.show()
+
+# Bias change analysis
+print("\nBias Change Analysis:")
+for feat in sensitive_features:
+    pre_gini = float(comparison_df[comparison_df['Feature'] == feat]['Pre-SMOTE Gini'].values[0][:-1])
+    post_gini = float(comparison_df[comparison_df['Feature'] == feat]['Post-SMOTE Gini'].values[0][:-1])
+
+    print(f"\n{feat}:")
+    print(f"  - Pre-SMOTE Gini: {pre_gini:.4f} ({'High bias' if pre_gini > 0.3 else 'Moderate bias' if pre_gini > 0.2 else 'Low bias'})")
+    print(f"  - Post-SMOTE Gini: {post_gini:.4f} ({'High bias' if post_gini > 0.3 else 'Moderate bias' if post_gini > 0.2 else 'Low bias'})")
+    print(f"  - Change: {post_gini - pre_gini:+.4f}")
+
+    if abs(post_gini - pre_gini) < 0.05:
+        print("  ➤ SMOTE had minimal impact on representation bias")
+    elif post_gini < pre_gini:
+        print("  ➤ SMOTE REDUCED representation bias for this feature")
+    else:
+        print("  ➤ SMOTE INCREASED representation bias for this feature")
+
+# Update privileged groups for downstream use
+privileged_groups_train = post_smote_privileged.copy()
+
+# ===================================================
+# Fixed calculate_fairness_metrics_full function
+# ===================================================
+def calculate_fairness_metrics_full(X_data, y_data, y_pred, sensitive_feature):
+    groups = X_data[sensitive_feature].unique()
+    tprs = []
+    fprs = []
+    parity_rates = []
+
+    for group in groups:
+        group_idx = X_data[sensitive_feature] == group
+        group_y_data = y_data[group_idx]
+        group_y_pred = y_pred[group_idx]
+
+        if len(group_y_data) == 0:
+            continue
+
+        # Calculate TPR (recall)
+        group_tpr = recall_score(group_y_data, group_y_pred, zero_division=0)
+        tprs.append(group_tpr)
+
+        # Calculate FPR with proper handling
+        try:
+            # Use labels to ensure 2x2 matrix even with single class
+            cm = confusion_matrix(group_y_data, group_y_pred, labels=[0, 1])
+            tn, fp, fn, tp = cm.ravel()
+            group_fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+        except ValueError:
+            # Fallback in case of issues
+            group_fpr = 0
+        fprs.append(group_fpr)
+
+        # Calculate positive prediction rate
+        group_parity = group_y_pred.mean()
+        parity_rates.append(group_parity)
+
+    # Handle cases with no valid groups
+    if not tprs:
+        tprs = [0]
+    if not parity_rates:
+        parity_rates = [0]
+    if not fprs:
+        fprs = [0]
+
+    # FIX: Ensure we have at least 2 groups for differences
+    eod = max(tprs) - min(tprs) if len(tprs) > 1 else 0
+    spd = max(parity_rates) - min(parity_rates) if len(parity_rates) > 1 else 0
+    eodd = (max(tprs) - min(tprs)) + (max(fprs) - min(fprs)) if (len(tprs) > 1 and len(fprs) > 1) else 0
+    fairness_ratio = eod / spd if spd != 0 else 0
+
+    return {
+        'TPR': tprs,
+        'FPR': fprs,
+        'Parity_Rate': parity_rates,
+        'Equal_Opportunity_Diff': eod,
+        'Statistical_Parity_Diff': spd,
+        'Equalised_Odds_Difference': eodd,
+        'Fairness_Ratio': fairness_ratio
+    }
+
+# ===================================================
+# SHAP Consistency Calculation Function (FIXED)
+# ===================================================
+def calculate_shap_consistency_gap(model, X_sample, sensitive_features):
+    """Calculate max SHAP consistency gap across sensitive features"""
+    explainer = shap.TreeExplainer(model)
+    shap_values_all = explainer.shap_values(X_sample)
+
+    # Handle SHAP values extraction
+    if isinstance(shap_values_all, list):
+        # For binary classification, use class 1 SHAP values
+        shap_values = shap_values_all[1]
+    elif len(shap_values_all.shape) == 3:
+        # Handle 3D array (samples, features, classes)
+        shap_values = shap_values_all[:, :, 1]  # Use class 1 values
+    else:
+        shap_values = shap_values_all
+
+    # Ensure SHAP values are 2D array
+    if len(shap_values.shape) == 1:
+        shap_values = shap_values.reshape(1, -1)
+    elif len(shap_values.shape) == 3:
+        # Flatten last two dimensions if needed
+        shap_values = shap_values.reshape(shap_values.shape[0], -1)
+
+    n_samples_shap = shap_values.shape[0]
+    max_gap = 0
+
+    for feat in sensitive_features:
+        groups = X_sample[feat].unique()
+        group_consistencies = []
+
+        for group in groups:
+            # Create boolean mask for group
+            group_mask = (X_sample[feat] == group).values
+
+            # Trim mask to match SHAP values length if needed
+            if len(group_mask) > n_samples_shap:
+                group_mask = group_mask[:n_samples_shap]
+
+            # Only proceed if we have samples to process
+            if group_mask.sum() == 0:
+                continue
+
+            group_shap = shap_values[group_mask]
+
+            # Skip if not enough samples for similarity calculation
+            if len(group_shap) < 2:
+                continue
+
+            # Ensure array is 2D before cosine similarity
+            if len(group_shap.shape) > 2:
+                group_shap = group_shap.reshape(group_shap.shape[0], -1)
+
+            # Compute pairwise cosine similarities
+            sim_matrix = cosine_similarity(group_shap)
+            np.fill_diagonal(sim_matrix, np.nan)
+            group_consistency = np.nanmean(sim_matrix)
+            group_consistencies.append(group_consistency)
+
+        if len(group_consistencies) < 2:
+            continue
+
+        gap = max(group_consistencies) - min(group_consistencies)
+        if gap > max_gap:
+            max_gap = gap
+
+    return max_gap
+
+# ===================================================
+# OPTUNA Multi-Objective Hyperparameter Optimization with NSGA-II Sampler (FIXED)
+# ===================================================
+print("\n" + "="*80)
+print("Starting Multi-Objective OPTUNA Hyperparameter Optimization with NSGA-II")
+print("="*80)
+
+def objective(trial):
+    """Objective function for multi-objective Optuna optimization"""
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+        'max_depth': trial.suggest_int('max_depth', 5, 30),
+        'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 20),
+        'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2', None]),
+        'bootstrap': trial.suggest_categorical('bootstrap', [True, False]),
+        'class_weight': trial.suggest_categorical('class_weight', [None, 'balanced']),
+        'random_state': 42,
+        'n_jobs': -1
+    }
+
+    # Use 3-fold CV for optimization
+    n_folds = 3
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+    mcc_scores = []
+    eodd_scores = []
+    shap_gap_scores = []
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_res, y_train_res)):
+        X_fold_train, X_fold_val = X_train_res.iloc[train_idx], X_train_res.iloc[val_idx]
+        y_fold_train, y_fold_val = y_train_res.iloc[train_idx], y_train_res.iloc[val_idx]
+
+        model = RandomForestClassifier(**params)
+        model.fit(X_fold_train, y_fold_train)
+
+        # Performance: MCC
+        y_pred_val = model.predict(X_fold_val)
+        mcc = matthews_corrcoef(y_fold_val, y_pred_val)
+        mcc_scores.append(mcc)
+
+        # Fairness: 1 - EODD (maximize fairness = minimize EODD)
+        avg_eodd = 0
+        valid_features = 0
+        for feat in sensitive_features:
+            try:
+                fairness = calculate_fairness_metrics_full(X_fold_val, y_fold_val, y_pred_val, feat)
+                # FIX: Use Equalised_Odds_Difference instead of Equal_Opportunity_Diff
+                avg_eodd += fairness['Equalised_Odds_Difference']
+                valid_features += 1
+            except Exception as e:
+                # Skip feature if calculation fails
+                print(f"Fairness calculation error for {feat}: {str(e)}")
+                continue
+
+        if valid_features > 0:
+            avg_eodd /= valid_features
+        else:
+            avg_eodd = 0  # Default if no valid features
+        eodd_scores.append(avg_eodd)
+
+        # Explainability: 1 - SHAP_Consistency_Gap
+        # Sample 100 instances for SHAP computation
+        if len(X_fold_val) > 100:
+            sample_indices = np.random.choice(X_fold_val.index, 100, replace=False)
+            X_sample = X_fold_val.loc[sample_indices]
+        else:
+            X_sample = X_fold_val
+
+        shap_gap = calculate_shap_consistency_gap(model, X_sample, sensitive_features)
+        shap_gap_scores.append(shap_gap)
+
+    # Aggregate scores across folds
+    avg_mcc = np.mean(mcc_scores)
+    avg_eodd = np.mean(eodd_scores)
+    avg_shap_gap = np.mean(shap_gap_scores)
+
+    # Return objectives: maximize MCC, maximize (1 - EODD), maximize (1 - SHAP_Gap)
+    return avg_mcc, 1 - avg_eodd, 1 - avg_shap_gap
+
+# Create Optuna study with NSGA-II sampler (pruning disabled for multi-objective)
+study = optuna.create_study(
+    directions=['maximize', 'maximize', 'maximize'],
+    sampler=NSGAIISampler(),
+    pruner=None
+)
+
+# Optimize with 50 trials (reduced to 2 for quick demo)
+study.optimize(objective, n_trials=20, show_progress_bar=True)
+
+print("\n" + "="*80)
+print("Multi-Objective Optimization Complete")
+print("="*80)
+print(f"Number of trials: {len(study.trials)}")
+print(f"Number of non-dominated solutions: {len(study.best_trials)}")
+
+# ===================================================
+# SIMPLE 3D Pareto Front Visualization (Matplotlib)
+# ===================================================
+print("\nGenerating Simple 3D Pareto Front Visualization...")
+
+# Prepare data for plotting
+mcc_vals = []
+fairness_vals = []
+explainability_vals = []
+composite_scores = []  # Store composite scores
+
+for trial in study.best_trials:
+    mcc, fairness, explainability = trial.values
+    mcc_vals.append(mcc)
+    fairness_vals.append(fairness)
+    explainability_vals.append(explainability)
+
+    # SIMPLE COMPOSITE SCORE: Weighted average
+    composite_score = (0.5 * mcc) + (0.3 * fairness) + (0.2 * explainability)
+    composite_scores.append(composite_score)
+
+# Create 3D plot
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(111, projection='3d')
+
+# Plot all Pareto solutions
+sc = ax.scatter(mcc_vals, fairness_vals, explainability_vals,
+                c=composite_scores, cmap='viridis', s=100)
+
+# Find best solution (highest composite score)
+best_idx = np.argmax(composite_scores)
+
+# Highlight best solution
+ax.scatter(mcc_vals[best_idx], fairness_vals[best_idx], explainability_vals[best_idx],
+           c='red', marker='*', s=300, label='Best Solution')
+
+# Add labels
+ax.set_xlabel('Performance (MCC)')
+ax.set_ylabel('Fairness (1 - EODD)')
+ax.set_zlabel('Explainability (1 - SHAP Gap)')
+ax.set_title('3D Pareto Front')
+
+# Add colorbar for composite score
+cbar = fig.colorbar(sc)
+cbar.set_label('Composite Score')
+
+# Add legend
+ax.legend()
+
+plt.tight_layout()
+plt.show()
+
+# ===================================================
+# Select Best Trial (Highest Composite Score)
+# ===================================================
+best_trial = study.best_trials[best_idx]
+best_params = best_trial.params
+print("\n" + "="*80)
+print("Selected Best Solution (Highest Composite Score)")
+print("="*80)
+print(f"Performance (MCC): {best_trial.values[0]:.4f}")
+print(f"Fairness (1 - EODD): {best_trial.values[1]:.4f}")
+print(f"Explainability (1 - SHAP Gap): {best_trial.values[2]:.4f}")
+print(f"Composite Score: {composite_scores[best_idx]:.4f} (weighted average)")
+print("\nBest Parameters:")
+for key, value in best_params.items():
+    print(f"- {key}: {value}")
+
+# ===================================================
+# Visualization: Optimization History
+# ===================================================
+print("\nGenerating Optimization History Plots...")
+
+# MCC History
+mcc_history = [t.values[0] for t in study.trials if t.values is not None]
+plt.figure(figsize=(10, 6))
+plt.plot(mcc_history, 'b-', alpha=0.3)
+plt.scatter(range(len(mcc_history)), mcc_history, s=20, alpha=0.8)
+plt.title('Optimization History: Performance (MCC)')
+plt.xlabel('Trial')
+plt.ylabel('MCC Score')
+plt.grid(True)
+plt.show()
+
+# Fairness History
+fairness_history = [t.values[1] for t in study.trials if t.values is not None]
+plt.figure(figsize=(10, 6))
+plt.plot(fairness_history, 'g-', alpha=0.3)
+plt.scatter(range(len(fairness_history)), fairness_history, s=20, alpha=0.8)
+plt.title('Optimization History: Fairness (1 - EODD)')
+plt.xlabel('Trial')
+plt.ylabel('Fairness Score')
+plt.grid(True)
+plt.show()
+
+# Explainability History
+explainability_history = [t.values[2] for t in study.trials if t.values is not None]
+plt.figure(figsize=(10, 6))
+plt.plot(explainability_history, 'r-', alpha=0.3)
+plt.scatter(range(len(explainability_history)), explainability_history, s=20, alpha=0.8)
+plt.title('Optimization History: Explainability (1 - SHAP Gap)')
+plt.xlabel('Trial')
+plt.ylabel('Explainability Score')
+plt.grid(True)
+plt.show()
+
+# ===================================================
+# Cross-Validation Setup (CV=5) with Optimized Parameters
+# ===================================================
+n_folds = 5
+skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+# Initialize model with best parameters
+rf_model = RandomForestClassifier(**best_params)
+
+cv_performance = {metric: [] for metric in ['Accuracy', 'Precision', 'Recall', 'F1', 'MCC','AUC']}
+cv_fairness = {feat: {'Equal_Opportunity_Diff': [], 'Statistical_Parity_Diff': [], 'Equalised_Odds_Difference': [], 'Fairness_Ratio': []}
+               for feat in sensitive_features}
+
+# ===================================================
+# Cross-Validation for Performance and Fairness
+# ===================================================
+print("="*80)
+print(f"Performing {n_folds}-fold Cross-Validation with Optimized Model")
+print("="*80)
+
+for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_res, y_train_res)):
+    print(f"\n>> Fold {fold+1}/{n_folds}")
+
+    X_fold_train, X_fold_val = X_train_res.iloc[train_idx], X_train_res.iloc[val_idx]
+    y_fold_train, y_fold_val = y_train_res.iloc[train_idx], y_train_res.iloc[val_idx]
+
+    rf_model.fit(X_fold_train, y_fold_train)
+    y_pred_val = rf_model.predict(X_fold_val)
+    y_pred_proba_val = rf_model.predict_proba(X_fold_val)[:, 1]
+
+    cv_performance['Accuracy'].append(accuracy_score(y_fold_val, y_pred_val))
+    cv_performance['Precision'].append(precision_score(y_fold_val, y_pred_val))
+    cv_performance['Recall'].append(recall_score(y_fold_val, y_pred_val))
+    cv_performance['F1'].append(f1_score(y_fold_val, y_pred_val))
+    cv_performance['MCC'].append(matthews_corrcoef(y_fold_val, y_pred_val))
+    cv_performance['AUC'].append(roc_auc_score(y_fold_val, y_pred_proba_val))
+
+    for feat in sensitive_features:
+        fairness = calculate_fairness_metrics_full(X_fold_val, y_fold_val, y_pred_val, feat)
+        cv_fairness[feat]['Equal_Opportunity_Diff'].append(fairness['Equal_Opportunity_Diff'])
+        cv_fairness[feat]['Statistical_Parity_Diff'].append(fairness['Statistical_Parity_Diff'])
+        cv_fairness[feat]['Equalised_Odds_Difference'].append(fairness['Equalised_Odds_Difference'])
+        cv_fairness[feat]['Fairness_Ratio'].append(fairness['Fairness_Ratio'])
+
+# ===================================================
+# Calculate Confidence Intervals (95%)
+# ===================================================
+def calculate_ci(data, confidence=0.95):
+    a = 1.0 * np.array(data)
+    n = len(a)
+    m, se = np.mean(a), stats.sem(a)
+    h = se * stats.t.ppf((1 + confidence) / 2., n-1)
+    return m, m-h, m+h
+
+perf_ci = {}
+for metric, values in cv_performance.items():
+    mean, lower, upper = calculate_ci(values)
+    perf_ci[metric] = {'mean': mean, 'lower': lower, 'upper': upper}
+
+fairness_ci = {}
+for feat, metrics in cv_fairness.items():
+    fairness_ci[feat] = {}
+    for metric, values in metrics.items():
+        mean, lower, upper = calculate_ci(values)
+        fairness_ci[feat][metric] = {'mean': mean, 'lower': lower, 'upper': upper}
+
+# ===================================================
+# Final Model Training on Full Training Set
+# ===================================================
+print("="*80)
+print("Training Final Optimized Random Forest on Balanced Data")
+print("="*80)
+rf_final = RandomForestClassifier(**best_params)
+rf_final.fit(X_train_res, y_train_res)
+
+# ===================================================
+# Performance Evaluation on Validation and Test Sets
+# ===================================================
+def evaluate_performance(model, X, y, set_name):
+    y_pred = model.predict(X)
+    y_pred_proba = model.predict_proba(X)[:, 1]
+
+    return {
+        'Accuracy': accuracy_score(y, y_pred),
+        'Precision': precision_score(y, y_pred),
+        'Recall': recall_score(y, y_pred),
+        'F1': f1_score(y, y_pred),
+        'MCC': matthews_corrcoef(y, y_pred),
+        'AUC': roc_auc_score(y, y_pred_proba),
+        'Log Loss': log_loss(y, y_pred_proba),
+        'Brier Score': brier_score_loss(y, y_pred_proba)
+    }
+
+val_metrics = evaluate_performance(rf_final, X_val, y_val, "Validation")
+test_metrics = evaluate_performance(rf_final, X_test, y_test, "Test")
+
+print("="*80)
+print("Validation Set Performance Metrics")
+print("="*80)
+for metric, value in val_metrics.items():
+    print(f"{metric}: {value:.4f}")
+
+print("\n" + "="*80)
+print("Test Set Performance Metrics")
+print("="*80)
+for metric, value in test_metrics.items():
+    print(f"{metric}: {value:.4f}")
+
+fpr, tpr, _ = roc_curve(y_test, rf_final.predict_proba(X_test)[:, 1])
+roc_auc = auc(fpr, tpr)
+
+plt.figure()
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Test Set Receiver Operating Characteristic')
+plt.legend(loc="lower right")
+plt.show()
+
+# ===================================================
+# Fairness Evaluation on Test Set (FIXED)
+# ===================================================
+y_test_pred = rf_final.predict(X_test)
+test_fairness = {}
+for feature in sensitive_features:
+    test_fairness[feature] = calculate_fairness_metrics_full(X_test, y_test, y_test_pred, feature)
+
+print("="*80)
+print("Test Set Fairness Metrics")
+print("="*80)
+for feature, results in test_fairness.items():
+    print(f"\nSensitive Feature: {feature}")
+    print(f"  - Training Privileged Group: {privileged_groups_train[feature]}")
+    print(f"  - Test Privileged Group: {privileged_groups_test[feature]}")
+    print(f"  - Equal Opportunity Difference: {results['Equal_Opportunity_Diff']:.4f}")
+    print(f"  - Statistical Parity Difference: {results['Statistical_Parity_Diff']:.4f}")
+    print(f"  - Fairness Ratio: {results['Fairness_Ratio']:.4f}")
+    print(f"  - Equalised Odds Difference: {results['Equalised_Odds_Difference']:.4f}")
+
+fig, axes = plt.subplots(len(sensitive_features), 2, figsize=(15, 5*len(sensitive_features)))
+
+for i, feature in enumerate(sensitive_features):
+    priv_train = privileged_groups_train[feature]
+    priv_test = privileged_groups_test[feature]
+
+    ax1 = axes[i, 0] if len(sensitive_features) > 1 else axes[0]
+    groups = X_test[feature].unique()
+    tprs = test_fairness[feature]['TPR']
+
+    colors = []
+    for group in groups:
+        if group == priv_train and group == priv_test:
+            colors.append('purple')
+        elif group == priv_train:
+            colors.append('green')
+        elif group == priv_test:
+            colors.append('orange')
+        else:
+            colors.append('blue')
+
+    sns.barplot(x=groups, y=tprs, ax=ax1, palette=colors)
+    title = f'True Positive Rate by {feature}\n'
+    title += f'Train Priv: {priv_train}, Test Priv: {priv_test}'
+    ax1.set_title(title)
+    ax1.set_ylabel('TPR')
+    ax1.set_ylim(0, 1)
+
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='green', label='Training Privileged'),
+        Patch(facecolor='orange', label='Test Privileged'),
+        Patch(facecolor='purple', label='Both'),
+        Patch(facecolor='blue', label='Neither')
+    ]
+    ax1.legend(handles=legend_elements, loc='best')
+
+    ax2 = axes[i, 1] if len(sensitive_features) > 1 else axes[1]
+    parity_rates = test_fairness[feature]['Parity_Rate']
+
+    sns.barplot(x=groups, y=parity_rates, ax=ax2, palette=colors)
+    title = f'Positive Prediction Rate by {feature}\n'
+    title += f'Train Priv: {priv_train}, Test Priv: {priv_test}'
+    ax2.set_title(title)
+    ax2.set_ylabel('Prediction Rate')
+    ax2.set_ylim(0, 1)
+    ax2.legend(handles=legend_elements, loc='best')
+
+plt.tight_layout()
+plt.show()
+
+# ===================================================
+# SHAP Explainability Analysis on Test Set
+# ===================================================
+print("="*80)
+print("SHAP Explainability Analysis")
+print("="*80)
+
+explainer = shap.TreeExplainer(rf_final)
+shap_values_all = explainer.shap_values(X_test)
+
+if isinstance(shap_values_all, list) and len(shap_values_all) == 2:
+    shap_values = np.array(shap_values_all[1])
+    base_value = explainer.expected_value[1]
+elif len(np.array(shap_values_all).shape) == 3:
+    shap_values = np.array(shap_values_all)[:, :, 1]
+    base_value = explainer.expected_value[1]
+else:
+    shap_values = np.array(shap_values_all)
+    base_value = explainer.expected_value
+
+if shap_values.shape != X_test.shape:
+    if shap_values.shape[0] == X_test.shape[1] and shap_values.shape[1] == X_test.shape[0]:
+        shap_values = shap_values.T
+    else:
+        # Handle shape mismatch by reshaping
+        if shap_values.shape[0] == X_test.shape[0]:
+            shap_values = shap_values.reshape(X_test.shape[0], -1)
+        else:
+            raise ValueError(f"SHAP values shape {shap_values.shape} doesn't match X_test shape {X_test.shape}")
+
+plt.figure(figsize=(12, 8))
+shap.summary_plot(shap_values, X_test, plot_type="bar")
+plt.title('Optimized Random Forest: Global Feature Importance', fontsize=16)
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(12, 8))
+shap.summary_plot(shap_values, X_test)
+plt.title('Optimized Random Forest: Feature Impact Direction', fontsize=16)
+plt.tight_layout()
+plt.show()
+
+mean_abs_shap = np.abs(shap_values).mean(axis=0)
+mean_shap_df = pd.DataFrame({
+    'Feature': X_test.columns,
+    'Mean |SHAP|': mean_abs_shap
+}).sort_values('Mean |SHAP|', ascending=False)
+
+print("\nSHAP Feature Importance:")
+print(mean_shap_df.round(4))
+
+print("\nIndividual Instance Explanations:")
+print("Sensitive Feature Analysis:")
+
+age_min = X_test['agecat'].min()
+age_max = X_test['agecat'].max()
+young_sample = X_test[X_test['agecat'] == age_min].index[0]
+old_sample = X_test[X_test['agecat'] == age_max].index[0]
+sensitive_samples = [young_sample, old_sample]
+
+for idx in sensitive_samples:
+    instance_idx = X_test.index.get_loc(idx)
+
+    shap.plots.waterfall(
+        shap.Explanation(
+            values=shap_values[instance_idx],
+            base_values=base_value,
+            data=X_test.iloc[instance_idx],
+            feature_names=X_test.columns
+        )
+    )
+    plt.title(f'Waterfall Plot (Instance #{idx})', fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+    actual_class = y_test.loc[idx]
+    pred_class = y_test_pred[instance_idx]
+    print(f"Actual: {actual_class}, Predicted: {pred_class}")
+
+    sensitive_shaps = {}
+    for feat in sensitive_features:
+        feat_idx = list(X_test.columns).index(feat)
+        sensitive_shaps[feat] = shap_values[instance_idx, feat_idx]
+
+    print("Sensitive Feature Contributions:")
+    for feat, val in sensitive_shaps.items():
+        is_train_priv = X_test.loc[idx, feat] == privileged_groups_train[feat]
+        is_test_priv = X_test.loc[idx, feat] == privileged_groups_test[feat]
+
+        status = ""
+        if is_train_priv and is_test_priv:
+            status = "[TRAIN & TEST PRIVILEGED]"
+        elif is_train_priv:
+            status = "[TRAIN PRIVILEGED]"
+        elif is_test_priv:
+            status = "[TEST PRIVILEGED]"
+
+        print(f"- {feat} ({X_test.loc[idx, feat]}) {status}: {val:.4f}")
+
+# ===================================================
+# Explanation Fairness Analysis
+# ===================================================
+print("="*80)
+print("EXPLANATION FAIRNESS ANALYSIS")
+print("="*80)
+print("Evaluating if explanations are consistent across sensitive groups...")
+
+print("\n1. FEATURE IMPORTANCE FAIRNESS:")
+print("-"*60)
+print("Comparing feature importance distributions across groups:")
+
+for feature in sensitive_features:
+    print(f"\n>> Sensitive Feature: {feature}")
+    priv_train = privileged_groups_train[feature]
+    priv_test = privileged_groups_test[feature]
+    groups = X_test[feature].unique()
+
+    group_importances = {}
+    for group in groups:
+        group_idx = X_test[feature] == group
+        group_shap = np.abs(shap_values[group_idx]).mean(axis=0)
+        group_importances[group] = group_shap
+
+    importance_df = pd.DataFrame(group_importances, index=X_test.columns)
+    importance_df['Std_Across_Groups'] = importance_df.std(axis=1)
+    importance_df['Max_Diff'] = importance_df.max(axis=1) - importance_df.min(axis=1)
+
+    print("\nTop features with highest variation across groups:")
+    print(importance_df.sort_values('Max_Diff', ascending=False).head(10).round(4))
+
+    top_features = importance_df.sort_values('Max_Diff', ascending=False).index[:3]
+    print("\nStatistical significance of differences (ANOVA):")
+    for feat in top_features:
+        group_data = [importance_df.loc[feat, group] for group in groups]
+        f_stat, p_value = stats.f_oneway(*group_data)
+        print(f"- {feat}: F-stat = {f_stat:.4f}, p-value = {p_value:.4f}")
+
+print("\n2. INDIVIDUAL EXPLANATION FAIRNESS:")
+print("-"*60)
+print("Comparing SHAP values for sensitive features across groups:")
+
+for feature in sensitive_features:
+    print(f"\n>> Sensitive Feature: {feature}")
+    priv_train = privileged_groups_train[feature]
+    priv_test = privileged_groups_test[feature]
+    groups = X_test[feature].unique()
+
+    feat_idx = list(X_test.columns).index(feature)
+    feature_shap = shap_values[:, feat_idx]
+
+    plot_data = []
+    for group in groups:
+        group_idx = X_test[feature] == group
+        group_shap_values = feature_shap[group_idx]
+        for value in group_shap_values:
+            plot_data.append({'Group': group, 'SHAP Value': value})
+
+    plot_df = pd.DataFrame(plot_data)
+
+    plt.figure(figsize=(10, 6))
+
+    colors = []
+    for group in groups:
+        if group == priv_train and group == priv_test:
+            colors.append('purple')
+        elif group == priv_train:
+            colors.append('green')
+        elif group == priv_test:
+            colors.append('orange')
+        else:
+            colors.append('blue')
+
+    box = sns.boxplot(x='Group', y='SHAP Value', data=plot_df, palette=colors)
+
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='green', label='Training Privileged'),
+        Patch(facecolor='orange', label='Test Privileged'),
+        Patch(facecolor='purple', label='Both'),
+        Patch(facecolor='blue', label='Neither')
+    ]
+    plt.legend(handles=legend_elements, loc='best')
+
+    plt.title(f'SHAP Value Distribution for {feature}\nTrain Priv: {priv_train}, Test Priv: {priv_test}')
+    plt.tight_layout()
+    plt.show()
+
+    print("\nStatistical significance tests:")
+    h_stat, p_value = stats.kruskal(*[plot_df[plot_df['Group'] == g]['SHAP Value'] for g in groups])
+    print(f"Kruskal-Wallis Test: H-stat = {h_stat:.4f}, p-value = {p_value:.4f}")
+
+    if priv_train in groups:
+        unprivileged = [g for g in groups if g != priv_train]
+        for group in unprivileged:
+            group1 = plot_df[plot_df['Group'] == priv_train]['SHAP Value']
+            group2 = plot_df[plot_df['Group'] == group]['SHAP Value']
+            u_stat, p_value = stats.mannwhitneyu(group1, group2, alternative='two-sided')
+            print(f"Train Privileged ({priv_train}) vs {group}: U-stat = {u_stat:.4f}, p-value = {p_value:.4f}")
+    else:
+        print(f"Training privileged group {priv_train} not found in test set")
+
+    if priv_test in groups and priv_test != priv_train:
+        unprivileged = [g for g in groups if g != priv_test]
+        for group in unprivileged:
+            group1 = plot_df[plot_df['Group'] == priv_test]['SHAP Value']
+            group2 = plot_df[plot_df['Group'] == group]['SHAP Value']
+            u_stat, p_value = stats.mannwhitneyu(group1, group2, alternative='two-sided')
+            print(f"Test Privileged ({priv_test}) vs {group}: U-stat = {u_stat:.4f}, p-value = {p_value:.4f}")
+
+print("\n3. EXPLANATION CONSISTENCY:")
+print("-"*60)
+print("Measuring consistency of explanations within groups:")
+
+explanation_consistency = {}
+for feature in sensitive_features:
+    groups = X_test[feature].unique()
+    consistency_scores = []
+
+    for group in groups:
+        group_idx = X_test[feature] == group
+        group_shap = shap_values[group_idx]
+
+        if len(group_shap) <= 1:
+            consistency_score = 1.0
+        else:
+            similarity_matrix = cosine_similarity(group_shap)
+            np.fill_diagonal(similarity_matrix, np.nan)
+            consistency_score = np.nanmean(similarity_matrix)
+        consistency_scores.append(consistency_score)
+
+    explanation_consistency[feature] = consistency_scores
+
+    priv_train = privileged_groups_train[feature]
+    priv_test = privileged_groups_test[feature]
+    print(f"\n{feature} group explanation consistency:")
+    print(f"  - Training Privileged Group: {priv_train}")
+    print(f"  - Test Privileged Group: {priv_test}")
+
+    for group, score in zip(groups, consistency_scores):
+        status = []
+        if group == priv_train:
+            status.append("TRAIN-PRIV")
+        if group == priv_test:
+            status.append("TEST-PRIV")
+        status_str = "[" + ", ".join(status) + "]" if status else ""
+        print(f"- Group {group} {status_str}: {score:.4f}")
+
+# ===================================================
+# Scientific Interpretation with CI
+# ===================================================
+print("="*80)
+print("SCIENTIFIC INTERPRETATION WITH 95% CONFIDENCE INTERVALS")
+print("="*80)
+
+print("\n1. PERFORMANCE ANALYSIS:")
+print("-"*60)
+print("Cross-Validation Performance (95% CI):")
+for metric, ci in perf_ci.items():
+    print(f"  - {metric}: {ci['mean']:.4f} ({ci['lower']:.4f}-{ci['upper']:.4f})")
+
+print("\nValidation Set Performance:")
+for metric, value in val_metrics.items():
+    print(f"  - {metric}: {value:.4f}")
+
+print("\nTest Set Performance:")
+for metric, value in test_metrics.items():
+    print(f"  - {metric}: {value:.4f}")
+
+print("\n2. FAIRNESS ASSESSMENT:")
+print("-"*60)
+print("Cross-Validation Fairness (95% CI):")
+for feat, metrics in fairness_ci.items():
+    print(f"\nSensitive Feature: {feat} (Training Privileged: {privileged_groups_train[feat]})")
+    for metric, ci in metrics.items():
+        print(f"  - {metric}: {ci['mean']:.4f} ({ci['lower']:.4f}-{ci['upper']:.4f})")
+
+print("\nTest Set Fairness Metrics:")
+for feature, results in test_fairness.items():
+    print(f"\nSensitive Feature: {feature}")
+    print(f"  - Training Privileged Group: {privileged_groups_train[feature]}")
+    print(f"  - Test Privileged Group: {privileged_groups_test[feature]}")
+    print(f"  - Equal Opportunity Difference: {results['Equal_Opportunity_Diff']:.4f}")
+    print(f"  - Statistical Parity Difference: {results['Statistical_Parity_Diff']:.4f}")
+    print(f"  - Fairness Ratio: {results['Fairness_Ratio']:.4f}")
+    print(f"  - Equalised Odds Difference: {results['Equalised_Odds_Difference']:.4f}")
+
+print("\n3. EXPLANATION FAIRNESS ASSESSMENT:")
+print("-"*60)
+print("Key findings from explanation fairness analysis:")
+for feature in sensitive_features:
+    print(f"\n>> {feature}:")
+    print(f"  - Training Privileged Group: {privileged_groups_train[feature]}")
+    print(f"  - Test Privileged Group: {privileged_groups_test[feature]}")
+
+    groups = X_test[feature].unique()
+    consistency_scores = explanation_consistency[feature]
+    priv_train = privileged_groups_train[feature]
+    priv_test = privileged_groups_test[feature]
+
+    min_consistency = min(consistency_scores)
+    max_consistency = max(consistency_scores)
+    overall_gap = max_consistency - min_consistency
+
+    if priv_train in groups:
+        priv_train_idx = np.where(groups == priv_train)[0][0]
+        priv_train_consistency = consistency_scores[priv_train_idx]
+        print(f"  - SHAP Training Privileged Consistency: {priv_train_consistency:.4f}")
+    else:
+        print(f"  - Training privileged group '{priv_train}' not found in test set")
+        priv_train_consistency = None
+
+    if priv_test in groups:
+        priv_test_idx = np.where(groups == priv_test)[0][0]
+        priv_test_consistency = consistency_scores[priv_test_idx]
+        print(f"  - SHAP Test Privileged Consistency: {priv_test_consistency:.4f}")
+    else:
+        print(f"  - Test privileged group '{priv_test}' not found in test set")
+        priv_test_consistency = None
+
+    print(f"  - SHAP Minimum Consistency: {min_consistency:.4f}")
+    print(f"  - SHAP Maximum Consistency: {max_consistency:.4f}")
+    print(f"  - SHAP Overall Consistency Gap: {overall_gap:.4f}")
+
+    if priv_train_consistency is not None:
+        train_gap = priv_train_consistency - min_consistency
+        print(f"  - SHAP Training Privileged Gap: {train_gap:.4f}")
+
+    if priv_test_consistency is not None:
+        test_gap = priv_test_consistency - min_consistency
+        print(f"  - SHAP Test Privileged Gap: {test_gap:.4f}")
+
+# ===================================================
+# SHAP Consistency Gap Analysis
+# ===================================================
+print("\n" + "="*80)
+print("SHAP CONSISTENCY GAP ANALYSIS")
+print("="*80)
+
+shap_consistency_gap_showed = False
+
+for feature in sensitive_features:
+    groups = X_test[feature].unique()
+    consistency_scores = explanation_consistency[feature]
+    min_consistency = min(consistency_scores)
+    max_consistency = max(consistency_scores)
+    overall_gap = max_consistency - min_consistency
+
+    print(f"\n{feature}:")
+    print(f"  - SHAP Minimum Consistency: {min_consistency:.4f}")
+    print(f"  - SHAP Maximum Consistency: {max_consistency:.4f}")
+    print(f"  - SHAP Overall Consistency Gap: {overall_gap:.4f}")
+
+    if overall_gap > 0.05:  # Significant gap threshold
+        shap_consistency_gap_showed = True
+        print("  ➤ SIGNIFICANT SHAP CONSISTENCY GAP DETECTED")
+    else:
+        print("  ➤ No significant SHAP consistency gap detected")
+
+print("\n" + "="*80)
+print("OVERALL CONCLUSION ON SHAP CONSISTENCY GAP")
+print("="*80)
+if shap_consistency_gap_showed:
+    print("YES, the analysis showed significant SHAP Consistency Gap")
+    print("• Different demographic groups received explanations with varying consistency")
+    print("• The gap between the most and least consistent groups exceeded 0.05")
+    print("• This indicates potential fairness issues in model explanations")
+else:
+    print("NO significant SHAP Consistency Gap was detected")
+    print("• Explanations were reasonably consistent across demographic groups")
+    print("• The gap between the most and least consistent groups was below 0.05")
+    print("• Model explanations show consistent behavior across protected attributes")
+
+print("\nRecommendations:")
+print("- For significant gaps: Implement explanation-aware fairness constraints")
+print("- Monitor SHAP consistency regularly as part of model audits")
+print("- Consider using adversarial training to align explanations across groups")
+print("- Set explanation consistency thresholds in model deployment standards")
+
+----------------END---------------------------------------
+
+---------------------MOO for XGBoost------------------------------
+
+# ===================================================
+# Import Required Libraries (ADD XGBOOST)
+# ===================================================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from xgboost import XGBClassifier  # CHANGED: Replace RandomForest with XGBoost
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                            f1_score, roc_auc_score, log_loss,
+                            brier_score_loss, matthews_corrcoef,
+                            confusion_matrix, roc_curve, auc)
+from imblearn.over_sampling import BorderlineSMOTE
+import shap
+from scipy import stats
+import warnings
+import optuna
+from optuna.samplers import NSGAIISampler
+from sklearn.metrics.pairwise import cosine_similarity
+from mpl_toolkits.mplot3d import Axes3D  # For 3D plotting
+
+warnings.filterwarnings('ignore')
+
+# Set global parameters
+np.random.seed(42)
+sns.set(style="whitegrid", font_scale=1.2)
+plt.rcParams['figure.figsize'] = (12, 8)
+shap.initjs()
+
+# ===================================================
+# Data Loading and Stratified Splitting (80:10:10)
+# ===================================================
+# Load dataset
+df = pd.read_csv('wrangledbank.csv')
+X = df.drop('y', axis=1)
+y = df['y']
+
+# Convert integer columns to float to avoid SMOTE casting error
+int_cols = X.select_dtypes(include=['int', 'int32', 'int64']).columns
+if len(int_cols) > 0:
+    print(f"Converting integer columns to float: {list(int_cols)}")
+    X[int_cols] = X[int_cols].astype(np.float64)
+
+# First split: 80% training, 20% temporary test
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# Second split: 10% validation, 10% test (50% of 20%)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp, test_size=0.5, stratify=y_temp, random_state=42
+)
+
+print("="*80)
+print("Stratified Split Distribution")
+print("="*80)
+print(f"Training set: {X_train.shape[0]} samples (Positive: {y_train.sum()}, {y_train.mean():.2%})")
+print(f"Validation set: {X_val.shape[0]} samples (Positive: {y_val.sum()}, {y_val.mean():.2%})")
+print(f"Testing set: {X_test.shape[0]} samples (Positive: {y_test.sum()}, {y_test.mean():.2%})")
+
+# Identify sensitive features
+sensitive_features = ['agecat', 'marital', 'education']
+
+# Determine privileged groups from training data
+privileged_groups_train = {}
+for feat in sensitive_features:
+    privileged_groups_train[feat] = X_train[feat].mode()[0]
+
+# Determine privileged groups from test data
+privileged_groups_test = {}
+for feat in sensitive_features:
+    privileged_groups_test[feat] = X_test[feat].mode()[0]
+
+print("\nPrivileged groups determined from training data:")
+for feat, val in privileged_groups_train.items():
+    print(f"- {feat}: {val}")
+
+print("\nPrivileged groups determined from test data:")
+for feat, val in privileged_groups_test.items():
+    print(f"- {feat}: {val}")
+
+# ===================================================
+# Apply Borderline-SMOTE to Training Data (FIXED)
+# ===================================================
+print("="*80)
+print("Applying Borderline-SMOTE to Training Data")
+print("="*80)
+print(f"Before SMOTE: Class 0 = {sum(y_train == 0)}, Class 1 = {sum(y_train == 1)}")
+
+# Store pre-SMOTE privileged groups and distributions
+pre_smote_privileged = privileged_groups_train.copy()
+pre_smote_distributions = {}
+for feat in sensitive_features:
+    pre_smote_distributions[feat] = X_train[feat].value_counts(normalize=True).to_dict()
+
+smote = BorderlineSMOTE(sampling_strategy='auto', kind='borderline-2', random_state=42)
+X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+
+# Convert back to DataFrame with proper column names and data types (CRITICAL FIX)
+X_train_res = pd.DataFrame(X_train_res, columns=X_train.columns)
+for col in X_train.columns:
+    X_train_res[col] = X_train_res[col].astype(X_train[col].dtype)
+
+print(f"After SMOTE: Class 0 = {sum(y_train_res == 0)}, Class 1 = {sum(y_train_res == 1)}")
+
+# ===================================================
+# Comparative Analysis: Privileged Groups Before/After SMOTE (FIXED)
+# ===================================================
+print("="*80)
+print("Privileged Group Analysis: Before vs After SMOTE")
+print("="*80)
+
+# Determine privileged groups from resampled data
+post_smote_privileged = {}
+post_smote_distributions = {}
+for feat in sensitive_features:
+    # Get the most frequent category in resampled data
+    post_smote_privileged[feat] = X_train_res[feat].mode()[0]
+    # Get distribution
+    post_smote_distributions[feat] = X_train_res[feat].value_counts(normalize=True).to_dict()
+
+# Create comparison table
+comparison_data = []
+for feat in sensitive_features:
+    pre_mode = pre_smote_privileged[feat]
+    post_mode = post_smote_privileged[feat]
+    changed = "YES" if pre_mode != post_mode else "NO"
+
+    # Calculate bias change metrics
+    pre_rep = pre_smote_distributions[feat].get(pre_mode, 0)
+    post_rep = post_smote_distributions[feat].get(post_mode, 0)
+    rep_change = post_rep - pre_rep
+
+    # Calculate Gini coefficient for bias measurement
+    def gini_coeff(values):
+        sorted_vals = np.sort(np.array(list(values)))
+        n = len(sorted_vals)
+        index = np.arange(1, n+1)
+        return (np.sum((2 * index - n - 1) * sorted_vals)) / (n * np.sum(sorted_vals))
+
+    pre_gini = gini_coeff(list(pre_smote_distributions[feat].values()))
+    post_gini = gini_coeff(list(post_smote_distributions[feat].values()))
+    gini_change = post_gini - pre_gini
+
+    comparison_data.append({
+        'Feature': feat,
+        'Pre-SMOTE Privileged': pre_mode,
+        'Post-SMOTE Privileged': post_mode,
+        'Changed': changed,
+        'Pre-SMOTE Representation': f"{pre_rep:.2%}",
+        'Post-SMOTE Representation': f"{post_rep:.2%}",
+        'Representation Change': f"{rep_change:+.2f}",
+        'Pre-SMOTE Gini': f"{pre_gini:.4f}",
+        'Post-SMOTE Gini': f"{post_gini:.4f}",
+        'Gini Change': f"{gini_change:+.4f}",
+        'Bias Status': "Reduced" if gini_change < 0 else "Increased"
+    })
+
+# Create and display comparison DataFrame
+comparison_df = pd.DataFrame(comparison_data)
+print("\nPrivileged Group Comparison:")
+print(comparison_df.to_string(index=False))
+
+# Visualization: Distribution changes (FIXED)
+fig, axes = plt.subplots(len(sensitive_features), 2, figsize=(16, 6*len(sensitive_features)))
+for i, feat in enumerate(sensitive_features):
+    # Pre-SMOTE distribution
+    ax1 = axes[i, 0] if len(sensitive_features) > 1 else axes[0]
+    pre_dist = pre_smote_distributions[feat]
+    pre_categories = list(pre_dist.keys())
+    pre_values = list(pre_dist.values())
+    sns.barplot(x=pre_categories, y=pre_values, ax=ax1, palette='viridis')
+    ax1.axhline(y=1/len(pre_dist), color='r', linestyle='--', alpha=0.7)
+    ax1.set_title(f'Pre-SMOTE Distribution: {feat}\nPrivileged: {pre_smote_privileged[feat]}')
+    ax1.set_ylim(0, 1)
+    ax1.tick_params(axis='x', rotation=45)
+
+    # Post-SMOTE distribution
+    ax2 = axes[i, 1] if len(sensitive_features) > 1 else axes[1]
+    post_dist = post_smote_distributions[feat]
+    post_categories = list(post_dist.keys())
+    post_values = list(post_dist.values())
+    sns.barplot(x=post_categories, y=post_values, ax=ax2, palette='viridis')
+    ax2.axhline(y=1/len(post_dist), color='r', linestyle='--', alpha=0.7)
+    ax2.set_title(f'Post-SMOTE Distribution: {feat}\nPrivileged: {post_smote_privileged[feat]}')
+    ax2.set_ylim(0, 1)
+    ax2.tick_params(axis='x', rotation=45)
+
+plt.tight_layout()
+plt.suptitle('Sensitive Feature Distribution: Before vs After SMOTE', y=1.02, fontsize=16)
+plt.show()
+
+# Bias change analysis
+print("\nBias Change Analysis:")
+for feat in sensitive_features:
+    pre_gini = float(comparison_df[comparison_df['Feature'] == feat]['Pre-SMOTE Gini'].values[0][:-1])
+    post_gini = float(comparison_df[comparison_df['Feature'] == feat]['Post-SMOTE Gini'].values[0][:-1])
+
+    print(f"\n{feat}:")
+    print(f"  - Pre-SMOTE Gini: {pre_gini:.4f} ({'High bias' if pre_gini > 0.3 else 'Moderate bias' if pre_gini > 0.2 else 'Low bias'})")
+    print(f"  - Post-SMOTE Gini: {post_gini:.4f} ({'High bias' if post_gini > 0.3 else 'Moderate bias' if post_gini > 0.2 else 'Low bias'})")
+    print(f"  - Change: {post_gini - pre_gini:+.4f}")
+
+    if abs(post_gini - pre_gini) < 0.05:
+        print("  ➤ SMOTE had minimal impact on representation bias")
+    elif post_gini < pre_gini:
+        print("  ➤ SMOTE REDUCED representation bias for this feature")
+    else:
+        print("  ➤ SMOTE INCREASED representation bias for this feature")
+
+# Update privileged groups for downstream use
+privileged_groups_train = post_smote_privileged.copy()
+
+# ===================================================
+# Fixed calculate_fairness_metrics_full function
+# ===================================================
+def calculate_fairness_metrics_full(X_data, y_data, y_pred, sensitive_feature):
+    groups = X_data[sensitive_feature].unique()
+    tprs = []
+    fprs = []
+    parity_rates = []
+
+    for group in groups:
+        group_idx = X_data[sensitive_feature] == group
+        group_y_data = y_data[group_idx]
+        group_y_pred = y_pred[group_idx]
+
+        if len(group_y_data) == 0:
+            continue
+
+        # Calculate TPR (recall)
+        group_tpr = recall_score(group_y_data, group_y_pred, zero_division=0)
+        tprs.append(group_tpr)
+
+        # Calculate FPR with proper handling
+        try:
+            # Use labels to ensure 2x2 matrix even with single class
+            cm = confusion_matrix(group_y_data, group_y_pred, labels=[0, 1])
+            tn, fp, fn, tp = cm.ravel()
+            group_fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+        except ValueError:
+            # Fallback in case of issues
+            group_fpr = 0
+        fprs.append(group_fpr)
+
+        # Calculate positive prediction rate
+        group_parity = group_y_pred.mean()
+        parity_rates.append(group_parity)
+
+    # Handle cases with no valid groups
+    if not tprs:
+        tprs = [0]
+    if not parity_rates:
+        parity_rates = [0]
+    if not fprs:
+        fprs = [0]
+
+    # FIX: Ensure we have at least 2 groups for differences
+    eod = max(tprs) - min(tprs) if len(tprs) > 1 else 0
+    spd = max(parity_rates) - min(parity_rates) if len(parity_rates) > 1 else 0
+    eodd = (max(tprs) - min(tprs)) + (max(fprs) - min(fprs)) if (len(tprs) > 1 and len(fprs) > 1) else 0
+    fairness_ratio = eod / spd if spd != 0 else 0
+
+    return {
+        'TPR': tprs,
+        'FPR': fprs,
+        'Parity_Rate': parity_rates,
+        'Equal_Opportunity_Diff': eod,
+        'Statistical_Parity_Diff': spd,
+        'Equalised_Odds_Difference': eodd,
+        'Fairness_Ratio': fairness_ratio
+    }
+
+# ===================================================
+# SHAP Consistency Calculation Function (FIXED)
+# ===================================================
+def calculate_shap_consistency_gap(model, X_sample, sensitive_features):
+    """Calculate max SHAP consistency gap across sensitive features"""
+    explainer = shap.TreeExplainer(model)
+    shap_values_all = explainer.shap_values(X_sample)
+
+    # Handle SHAP values extraction
+    if isinstance(shap_values_all, list):
+        # For binary classification, use class 1 SHAP values
+        shap_values = shap_values_all[1]
+    elif len(shap_values_all.shape) == 3:
+        # Handle 3D array (samples, features, classes)
+        shap_values = shap_values_all[:, :, 1]  # Use class 1 values
+    else:
+        shap_values = shap_values_all
+
+    # Ensure SHAP values are 2D array
+    if len(shap_values.shape) == 1:
+        shap_values = shap_values.reshape(1, -1)
+    elif len(shap_values.shape) == 3:
+        # Flatten last two dimensions if needed
+        shap_values = shap_values.reshape(shap_values.shape[0], -1)
+
+    n_samples_shap = shap_values.shape[0]
+    max_gap = 0
+
+    for feat in sensitive_features:
+        groups = X_sample[feat].unique()
+        group_consistencies = []
+
+        for group in groups:
+            # Create boolean mask for group
+            group_mask = (X_sample[feat] == group).values
+
+            # Trim mask to match SHAP values length if needed
+            if len(group_mask) > n_samples_shap:
+                group_mask = group_mask[:n_samples_shap]
+
+            # Only proceed if we have samples to process
+            if group_mask.sum() == 0:
+                continue
+
+            group_shap = shap_values[group_mask]
+
+            # Skip if not enough samples for similarity calculation
+            if len(group_shap) < 2:
+                continue
+
+            # Ensure array is 2D before cosine similarity
+            if len(group_shap.shape) > 2:
+                group_shap = group_shap.reshape(group_shap.shape[0], -1)
+
+            # Compute pairwise cosine similarities
+            sim_matrix = cosine_similarity(group_shap)
+            np.fill_diagonal(sim_matrix, np.nan)
+            group_consistency = np.nanmean(sim_matrix)
+            group_consistencies.append(group_consistency)
+
+        if len(group_consistencies) < 2:
+            continue
+
+        gap = max(group_consistencies) - min(group_consistencies)
+        if gap > max_gap:
+            max_gap = gap
+
+    return max_gap
+
+# ===================================================
+# OPTUNA Multi-Objective Hyperparameter Optimization with NSGA-II Sampler (FIXED)
+# ===================================================
+print("\n" + "="*80)
+print("Starting Multi-Objective OPTUNA Hyperparameter Optimization with NSGA-II")
+print("="*80)
+
+def objective(trial):
+    """Objective function for multi-objective Optuna optimization"""
+    # CHANGED: XGBoost hyperparameters instead of Random Forest
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+        'max_depth': trial.suggest_int('max_depth', 3, 15),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+        'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+        'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+        'gamma': trial.suggest_float('gamma', 0, 1),
+        'reg_alpha': trial.suggest_float('reg_alpha', 0, 1),
+        'reg_lambda': trial.suggest_float('reg_lambda', 0, 1),
+        'random_state': 42,
+        'n_jobs': -1,
+        'use_label_encoder': False,
+        'eval_metric': 'logloss'
+    }
+
+    # Use 3-fold CV for optimization
+    n_folds = 3
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+    mcc_scores = []
+    eodd_scores = []
+    shap_gap_scores = []
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_res, y_train_res)):
+        X_fold_train, X_fold_val = X_train_res.iloc[train_idx], X_train_res.iloc[val_idx]
+        y_fold_train, y_fold_val = y_train_res.iloc[train_idx], y_train_res.iloc[val_idx]
+
+        # CHANGED: Use XGBClassifier instead of RandomForestClassifier
+        model = XGBClassifier(**params)
+        model.fit(X_fold_train, y_fold_train)
+
+        # Performance: MCC
+        y_pred_val = model.predict(X_fold_val)
+        mcc = matthews_corrcoef(y_fold_val, y_pred_val)
+        mcc_scores.append(mcc)
+
+        # Fairness: 1 - EODD (maximize fairness = minimize EODD)
+        avg_eodd = 0
+        valid_features = 0
+        for feat in sensitive_features:
+            try:
+                fairness = calculate_fairness_metrics_full(X_fold_val, y_fold_val, y_pred_val, feat)
+                # FIX: Use Equalised_Odds_Difference instead of Equal_Opportunity_Diff
+                avg_eodd += fairness['Equalised_Odds_Difference']
+                valid_features += 1
+            except Exception as e:
+                # Skip feature if calculation fails
+                print(f"Fairness calculation error for {feat}: {str(e)}")
+                continue
+
+        if valid_features > 0:
+            avg_eodd /= valid_features
+        else:
+            avg_eodd = 0  # Default if no valid features
+        eodd_scores.append(avg_eodd)
+
+        # Explainability: 1 - SHAP_Consistency_Gap
+        # Sample 100 instances for SHAP computation
+        if len(X_fold_val) > 100:
+            sample_indices = np.random.choice(X_fold_val.index, 100, replace=False)
+            X_sample = X_fold_val.loc[sample_indices]
+        else:
+            X_sample = X_fold_val
+
+        shap_gap = calculate_shap_consistency_gap(model, X_sample, sensitive_features)
+        shap_gap_scores.append(shap_gap)
+
+    # Aggregate scores across folds
+    avg_mcc = np.mean(mcc_scores)
+    avg_eodd = np.mean(eodd_scores)
+    avg_shap_gap = np.mean(shap_gap_scores)
+
+    # Return objectives: maximize MCC, maximize (1 - EODD), maximize (1 - SHAP_Gap)
+    return avg_mcc, 1 - avg_eodd, 1 - avg_shap_gap
+
+# Create Optuna study with NSGA-II sampler (pruning disabled for multi-objective)
+study = optuna.create_study(
+    directions=['maximize', 'maximize', 'maximize'],
+    sampler=NSGAIISampler(),
+    pruner=None
+)
+
+# Optimize with 50 trials (reduced to 2 for quick demo)
+study.optimize(objective, n_trials=20, show_progress_bar=True)
+
+print("\n" + "="*80)
+print("Multi-Objective Optimization Complete")
+print("="*80)
+print(f"Number of trials: {len(study.trials)}")
+print(f"Number of non-dominated solutions: {len(study.best_trials)}")
+
+# ===================================================
+# SIMPLE 3D Pareto Front Visualization (Matplotlib)
+# ===================================================
+print("\nGenerating Simple 3D Pareto Front Visualization...")
+
+# Prepare data for plotting
+mcc_vals = []
+fairness_vals = []
+explainability_vals = []
+composite_scores = []  # Store composite scores
+
+for trial in study.best_trials:
+    mcc, fairness, explainability = trial.values
+    mcc_vals.append(mcc)
+    fairness_vals.append(fairness)
+    explainability_vals.append(explainability)
+
+    # SIMPLE COMPOSITE SCORE: Weighted average
+    composite_score = (0.5 * mcc) + (0.3 * fairness) + (0.2 * explainability)
+    composite_scores.append(composite_score)
+
+# Create 3D plot
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(111, projection='3d')
+
+# Plot all Pareto solutions
+sc = ax.scatter(mcc_vals, fairness_vals, explainability_vals,
+                c=composite_scores, cmap='viridis', s=100)
+
+# Find best solution (highest composite score)
+best_idx = np.argmax(composite_scores)
+
+# Highlight best solution
+ax.scatter(mcc_vals[best_idx], fairness_vals[best_idx], explainability_vals[best_idx],
+           c='red', marker='*', s=300, label='Best Solution')
+
+# Add labels
+ax.set_xlabel('Performance (MCC)')
+ax.set_ylabel('Fairness (1 - EODD)')
+ax.set_zlabel('Explainability (1 - SHAP Gap)')
+ax.set_title('3D Pareto Front')
+
+# Add colorbar for composite score
+cbar = fig.colorbar(sc)
+cbar.set_label('Composite Score')
+
+# Add legend
+ax.legend()
+
+plt.tight_layout()
+plt.show()
+
+# ===================================================
+# Select Best Trial (Highest Composite Score)
+# ===================================================
+best_trial = study.best_trials[best_idx]
+best_params = best_trial.params
+print("\n" + "="*80)
+print("Selected Best Solution (Highest Composite Score)")
+print("="*80)
+print(f"Performance (MCC): {best_trial.values[0]:.4f}")
+print(f"Fairness (1 - EODD): {best_trial.values[1]:.4f}")
+print(f"Explainability (1 - SHAP Gap): {best_trial.values[2]:.4f}")
+print(f"Composite Score: {composite_scores[best_idx]:.4f} (weighted average)")
+print("\nBest Parameters:")
+for key, value in best_params.items():
+    print(f"- {key}: {value}")
+
+# ===================================================
+# Visualization: Optimization History
+# ===================================================
+print("\nGenerating Optimization History Plots...")
+
+# MCC History
+mcc_history = [t.values[0] for t in study.trials if t.values is not None]
+plt.figure(figsize=(10, 6))
+plt.plot(mcc_history, 'b-', alpha=0.3)
+plt.scatter(range(len(mcc_history)), mcc_history, s=20, alpha=0.8)
+plt.title('Optimization History: Performance (MCC)')
+plt.xlabel('Trial')
+plt.ylabel('MCC Score')
+plt.grid(True)
+plt.show()
+
+# Fairness History
+fairness_history = [t.values[1] for t in study.trials if t.values is not None]
+plt.figure(figsize=(10, 6))
+plt.plot(fairness_history, 'g-', alpha=0.3)
+plt.scatter(range(len(fairness_history)), fairness_history, s=20, alpha=0.8)
+plt.title('Optimization History: Fairness (1 - EODD)')
+plt.xlabel('Trial')
+plt.ylabel('Fairness Score')
+plt.grid(True)
+plt.show()
+
+# Explainability History
+explainability_history = [t.values[2] for t in study.trials if t.values is not None]
+plt.figure(figsize=(10, 6))
+plt.plot(explainability_history, 'r-', alpha=0.3)
+plt.scatter(range(len(explainability_history)), explainability_history, s=20, alpha=0.8)
+plt.title('Optimization History: Explainability (1 - SHAP Gap)')
+plt.xlabel('Trial')
+plt.ylabel('Explainability Score')
+plt.grid(True)
+plt.show()
+
+# ===================================================
+# Cross-Validation Setup (CV=5) with Optimized Parameters
+# ===================================================
+n_folds = 5
+skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+# Initialize model with best parameters (CHANGED to XGBClassifier)
+xgb_model = XGBClassifier(**best_params)
+
+cv_performance = {metric: [] for metric in ['Accuracy', 'Precision', 'Recall', 'F1', 'MCC','AUC']}
+cv_fairness = {feat: {'Equal_Opportunity_Diff': [], 'Statistical_Parity_Diff': [], 'Equalised_Odds_Difference': [], 'Fairness_Ratio': []}
+               for feat in sensitive_features}
+
+# ===================================================
+# Cross-Validation for Performance and Fairness
+# ===================================================
+print("="*80)
+print(f"Performing {n_folds}-fold Cross-Validation with Optimized Model")
+print("="*80)
+
+for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_res, y_train_res)):
+    print(f"\n>> Fold {fold+1}/{n_folds}")
+
+    X_fold_train, X_fold_val = X_train_res.iloc[train_idx], X_train_res.iloc[val_idx]
+    y_fold_train, y_fold_val = y_train_res.iloc[train_idx], y_train_res.iloc[val_idx]
+
+    xgb_model.fit(X_fold_train, y_fold_train)
+    y_pred_val = xgb_model.predict(X_fold_val)
+    y_pred_proba_val = xgb_model.predict_proba(X_fold_val)[:, 1]
+
+    cv_performance['Accuracy'].append(accuracy_score(y_fold_val, y_pred_val))
+    cv_performance['Precision'].append(precision_score(y_fold_val, y_pred_val))
+    cv_performance['Recall'].append(recall_score(y_fold_val, y_pred_val))
+    cv_performance['F1'].append(f1_score(y_fold_val, y_pred_val))
+    cv_performance['MCC'].append(matthews_corrcoef(y_fold_val, y_pred_val))
+    cv_performance['AUC'].append(roc_auc_score(y_fold_val, y_pred_proba_val))
+
+    for feat in sensitive_features:
+        fairness = calculate_fairness_metrics_full(X_fold_val, y_fold_val, y_pred_val, feat)
+        cv_fairness[feat]['Equal_Opportunity_Diff'].append(fairness['Equal_Opportunity_Diff'])
+        cv_fairness[feat]['Statistical_Parity_Diff'].append(fairness['Statistical_Parity_Diff'])
+        cv_fairness[feat]['Equalised_Odds_Difference'].append(fairness['Equalised_Odds_Difference'])
+        cv_fairness[feat]['Fairness_Ratio'].append(fairness['Fairness_Ratio'])
+
+# ===================================================
+# Calculate Confidence Intervals (95%)
+# ===================================================
+def calculate_ci(data, confidence=0.95):
+    a = 1.0 * np.array(data)
+    n = len(a)
+    m, se = np.mean(a), stats.sem(a)
+    h = se * stats.t.ppf((1 + confidence) / 2., n-1)
+    return m, m-h, m+h
+
+perf_ci = {}
+for metric, values in cv_performance.items():
+    mean, lower, upper = calculate_ci(values)
+    perf_ci[metric] = {'mean': mean, 'lower': lower, 'upper': upper}
+
+fairness_ci = {}
+for feat, metrics in cv_fairness.items():
+    fairness_ci[feat] = {}
+    for metric, values in metrics.items():
+        mean, lower, upper = calculate_ci(values)
+        fairness_ci[feat][metric] = {'mean': mean, 'lower': lower, 'upper': upper}
+
+# ===================================================
+# Final Model Training on Full Training Set
+# ===================================================
+print("="*80)
+print("Training Final Optimized XGBoost on Balanced Data")  # CHANGED: Random Forest -> XGBoost
+print("="*80)
+xgb_final = XGBClassifier(**best_params)  # CHANGED to XGBClassifier
+xgb_final.fit(X_train_res, y_train_res)
+
+# ===================================================
+# Performance Evaluation on Validation and Test Sets
+# ===================================================
+def evaluate_performance(model, X, y, set_name):
+    y_pred = model.predict(X)
+    y_pred_proba = model.predict_proba(X)[:, 1]
+
+    return {
+        'Accuracy': accuracy_score(y, y_pred),
+        'Precision': precision_score(y, y_pred),
+        'Recall': recall_score(y, y_pred),
+        'F1': f1_score(y, y_pred),
+        'MCC': matthews_corrcoef(y, y_pred),
+        'AUC': roc_auc_score(y, y_pred_proba),
+        'Log Loss': log_loss(y, y_pred_proba),
+        'Brier Score': brier_score_loss(y, y_pred_proba)
+    }
+
+val_metrics = evaluate_performance(xgb_final, X_val, y_val, "Validation")
+test_metrics = evaluate_performance(xgb_final, X_test, y_test, "Test")
+
+print("="*80)
+print("Validation Set Performance Metrics")
+print("="*80)
+for metric, value in val_metrics.items():
+    print(f"{metric}: {value:.4f}")
+
+print("\n" + "="*80)
+print("Test Set Performance Metrics")
+print("="*80)
+for metric, value in test_metrics.items():
+    print(f"{metric}: {value:.4f}")
+
+fpr, tpr, _ = roc_curve(y_test, xgb_final.predict_proba(X_test)[:, 1])
+roc_auc = auc(fpr, tpr)
+
+plt.figure()
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Test Set Receiver Operating Characteristic')
+plt.legend(loc="lower right")
+plt.show()
+
+# ===================================================
+# Fairness Evaluation on Test Set (FIXED)
+# ===================================================
+y_test_pred = xgb_final.predict(X_test)
+test_fairness = {}
+for feature in sensitive_features:
+    test_fairness[feature] = calculate_fairness_metrics_full(X_test, y_test, y_test_pred, feature)
+
+print("="*80)
+print("Test Set Fairness Metrics")
+print("="*80)
+for feature, results in test_fairness.items():
+    print(f"\nSensitive Feature: {feature}")
+    print(f"  - Training Privileged Group: {privileged_groups_train[feature]}")
+    print(f"  - Test Privileged Group: {privileged_groups_test[feature]}")
+    print(f"  - Equal Opportunity Difference: {results['Equal_Opportunity_Diff']:.4f}")
+    print(f"  - Statistical Parity Difference: {results['Statistical_Parity_Diff']:.4f}")
+    print(f"  - Fairness Ratio: {results['Fairness_Ratio']:.4f}")
+    print(f"  - Equalised Odds Difference: {results['Equalised_Odds_Difference']:.4f}")
+
+fig, axes = plt.subplots(len(sensitive_features), 2, figsize=(15, 5*len(sensitive_features)))
+
+for i, feature in enumerate(sensitive_features):
+    priv_train = privileged_groups_train[feature]
+    priv_test = privileged_groups_test[feature]
+
+    ax1 = axes[i, 0] if len(sensitive_features) > 1 else axes[0]
+    groups = X_test[feature].unique()
+    tprs = test_fairness[feature]['TPR']
+
+    colors = []
+    for group in groups:
+        if group == priv_train and group == priv_test:
+            colors.append('purple')
+        elif group == priv_train:
+            colors.append('green')
+        elif group == priv_test:
+            colors.append('orange')
+        else:
+            colors.append('blue')
+
+    sns.barplot(x=groups, y=tprs, ax=ax1, palette=colors)
+    title = f'True Positive Rate by {feature}\n'
+    title += f'Train Priv: {priv_train}, Test Priv: {priv_test}'
+    ax1.set_title(title)
+    ax1.set_ylabel('TPR')
+    ax1.set_ylim(0, 1)
+
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='green', label='Training Privileged'),
+        Patch(facecolor='orange', label='Test Privileged'),
+        Patch(facecolor='purple', label='Both'),
+        Patch(facecolor='blue', label='Neither')
+    ]
+    ax1.legend(handles=legend_elements, loc='best')
+
+    ax2 = axes[i, 1] if len(sensitive_features) > 1 else axes[1]
+    parity_rates = test_fairness[feature]['Parity_Rate']
+
+    sns.barplot(x=groups, y=parity_rates, ax=ax2, palette=colors)
+    title = f'Positive Prediction Rate by {feature}\n'
+    title += f'Train Priv: {priv_train}, Test Priv: {priv_test}'
+    ax2.set_title(title)
+    ax2.set_ylabel('Prediction Rate')
+    ax2.set_ylim(0, 1)
+    ax2.legend(handles=legend_elements, loc='best')
+
+plt.tight_layout()
+plt.show()
+
+# ===================================================
+# SHAP Explainability Analysis on Test Set
+# ===================================================
+print("="*80)
+print("SHAP Explainability Analysis")
+print("="*80)
+
+explainer = shap.TreeExplainer(xgb_final)  # CHANGED: rf_final -> xgb_final
+shap_values_all = explainer.shap_values(X_test)
+
+if isinstance(shap_values_all, list) and len(shap_values_all) == 2:
+    shap_values = np.array(shap_values_all[1])
+    base_value = explainer.expected_value[1]
+elif len(np.array(shap_values_all).shape) == 3:
+    shap_values = np.array(shap_values_all)[:, :, 1]
+    base_value = explainer.expected_value[1]
+else:
+    shap_values = np.array(shap_values_all)
+    base_value = explainer.expected_value
+
+if shap_values.shape != X_test.shape:
+    if shap_values.shape[0] == X_test.shape[1] and shap_values.shape[1] == X_test.shape[0]:
+        shap_values = shap_values.T
+    else:
+        # Handle shape mismatch by reshaping
+        if shap_values.shape[0] == X_test.shape[0]:
+            shap_values = shap_values.reshape(X_test.shape[0], -1)
+        else:
+            raise ValueError(f"SHAP values shape {shap_values.shape} doesn't match X_test shape {X_test.shape}")
+
+plt.figure(figsize=(12, 8))
+shap.summary_plot(shap_values, X_test, plot_type="bar")
+plt.title('Optimized XGBoost: Global Feature Importance', fontsize=16)  # CHANGED: Model name
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(12, 8))
+shap.summary_plot(shap_values, X_test)
+plt.title('Optimized XGBoost: Feature Impact Direction', fontsize=16)  # CHANGED: Model name
+plt.tight_layout()
+plt.show()
+
+mean_abs_shap = np.abs(shap_values).mean(axis=0)
+mean_shap_df = pd.DataFrame({
+    'Feature': X_test.columns,
+    'Mean |SHAP|': mean_abs_shap
+}).sort_values('Mean |SHAP|', ascending=False)
+
+print("\nSHAP Feature Importance:")
+print(mean_shap_df.round(4))
+
+print("\nIndividual Instance Explanations:")
+print("Sensitive Feature Analysis:")
+
+age_min = X_test['agecat'].min()
+age_max = X_test['agecat'].max()
+young_sample = X_test[X_test['agecat'] == age_min].index[0]
+old_sample = X_test[X_test['agecat'] == age_max].index[0]
+sensitive_samples = [young_sample, old_sample]
+
+for idx in sensitive_samples:
+    instance_idx = X_test.index.get_loc(idx)
+
+    shap.plots.waterfall(
+        shap.Explanation(
+            values=shap_values[instance_idx],
+            base_values=base_value,
+            data=X_test.iloc[instance_idx],
+            feature_names=X_test.columns
+        )
+    )
+    plt.title(f'Waterfall Plot (Instance #{idx})', fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+    actual_class = y_test.loc[idx]
+    pred_class = y_test_pred[instance_idx]
+    print(f"Actual: {actual_class}, Predicted: {pred_class}")
+
+    sensitive_shaps = {}
+    for feat in sensitive_features:
+        feat_idx = list(X_test.columns).index(feat)
+        sensitive_shaps[feat] = shap_values[instance_idx, feat_idx]
+
+    print("Sensitive Feature Contributions:")
+    for feat, val in sensitive_shaps.items():
+        is_train_priv = X_test.loc[idx, feat] == privileged_groups_train[feat]
+        is_test_priv = X_test.loc[idx, feat] == privileged_groups_test[feat]
+
+        status = ""
+        if is_train_priv and is_test_priv:
+            status = "[TRAIN & TEST PRIVILEGED]"
+        elif is_train_priv:
+            status = "[TRAIN PRIVILEGED]"
+        elif is_test_priv:
+            status = "[TEST PRIVILEGED]"
+
+        print(f"- {feat} ({X_test.loc[idx, feat]}) {status}: {val:.4f}")
+
+# ===================================================
+# Explanation Fairness Analysis
+# ===================================================
+print("="*80)
+print("EXPLANATION FAIRNESS ANALYSIS")
+print("="*80)
+print("Evaluating if explanations are consistent across sensitive groups...")
+
+print("\n1. FEATURE IMPORTANCE FAIRNESS:")
+print("-"*60)
+print("Comparing feature importance distributions across groups:")
+
+for feature in sensitive_features:
+    print(f"\n>> Sensitive Feature: {feature}")
+    priv_train = privileged_groups_train[feature]
+    priv_test = privileged_groups_test[feature]
+    groups = X_test[feature].unique()
+
+    group_importances = {}
+    for group in groups:
+        group_idx = X_test[feature] == group
+        group_shap = np.abs(shap_values[group_idx]).mean(axis=0)
+        group_importances[group] = group_shap
+
+    importance_df = pd.DataFrame(group_importances, index=X_test.columns)
+    importance_df['Std_Across_Groups'] = importance_df.std(axis=1)
+    importance_df['Max_Diff'] = importance_df.max(axis=1) - importance_df.min(axis=1)
+
+    print("\nTop features with highest variation across groups:")
+    print(importance_df.sort_values('Max_Diff', ascending=False).head(10).round(4))
+
+    top_features = importance_df.sort_values('Max_Diff', ascending=False).index[:3]
+    print("\nStatistical significance of differences (ANOVA):")
+    for feat in top_features:
+        group_data = [importance_df.loc[feat, group] for group in groups]
+        f_stat, p_value = stats.f_oneway(*group_data)
+        print(f"- {feat}: F-stat = {f_stat:.4f}, p-value = {p_value:.4f}")
+
+print("\n2. INDIVIDUAL EXPLANATION FAIRNESS:")
+print("-"*60)
+print("Comparing SHAP values for sensitive features across groups:")
+
+for feature in sensitive_features:
+    print(f"\n>> Sensitive Feature: {feature}")
+    priv_train = privileged_groups_train[feature]
+    priv_test = privileged_groups_test[feature]
+    groups = X_test[feature].unique()
+
+    feat_idx = list(X_test.columns).index(feature)
+    feature_shap = shap_values[:, feat_idx]
+
+    plot_data = []
+    for group in groups:
+        group_idx = X_test[feature] == group
+        group_shap_values = feature_shap[group_idx]
+        for value in group_shap_values:
+            plot_data.append({'Group': group, 'SHAP Value': value})
+
+    plot_df = pd.DataFrame(plot_data)
+
+    plt.figure(figsize=(10, 6))
+
+    colors = []
+    for group in groups:
+        if group == priv_train and group == priv_test:
+            colors.append('purple')
+        elif group == priv_train:
+            colors.append('green')
+        elif group == priv_test:
+            colors.append('orange')
+        else:
+            colors.append('blue')
+
+    box = sns.boxplot(x='Group', y='SHAP Value', data=plot_df, palette=colors)
+
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='green', label='Training Privileged'),
+        Patch(facecolor='orange', label='Test Privileged'),
+        Patch(facecolor='purple', label='Both'),
+        Patch(facecolor='blue', label='Neither')
+    ]
+    plt.legend(handles=legend_elements, loc='best')
+
+    plt.title(f'SHAP Value Distribution for {feature}\nTrain Priv: {priv_train}, Test Priv: {priv_test}')
+    plt.tight_layout()
+    plt.show()
+
+    print("\nStatistical significance tests:")
+    h_stat, p_value = stats.kruskal(*[plot_df[plot_df['Group'] == g]['SHAP Value'] for g in groups])
+    print(f"Kruskal-Wallis Test: H-stat = {h_stat:.4f}, p-value = {p_value:.4f}")
+
+    if priv_train in groups:
+        unprivileged = [g for g in groups if g != priv_train]
+        for group in unprivileged:
+            group1 = plot_df[plot_df['Group'] == priv_train]['SHAP Value']
+            group2 = plot_df[plot_df['Group'] == group]['SHAP Value']
+            u_stat, p_value = stats.mannwhitneyu(group1, group2, alternative='two-sided')
+            print(f"Train Privileged ({priv_train}) vs {group}: U-stat = {u_stat:.4f}, p-value = {p_value:.4f}")
+    else:
+        print(f"Training privileged group {priv_train} not found in test set")
+
+    if priv_test in groups and priv_test != priv_train:
+        unprivileged = [g for g in groups if g != priv_test]
+        for group in unprivileged:
+            group1 = plot_df[plot_df['Group'] == priv_test]['SHAP Value']
+            group2 = plot_df[plot_df['Group'] == group]['SHAP Value']
+            u_stat, p_value = stats.mannwhitneyu(group1, group2, alternative='two-sided')
+            print(f"Test Privileged ({priv_test}) vs {group}: U-stat = {u_stat:.4f}, p-value = {p_value:.4f}")
+
+print("\n3. EXPLANATION CONSISTENCY:")
+print("-"*60)
+print("Measuring consistency of explanations within groups:")
+
+explanation_consistency = {}
+for feature in sensitive_features:
+    groups = X_test[feature].unique()
+    consistency_scores = []
+
+    for group in groups:
+        group_idx = X_test[feature] == group
+        group_shap = shap_values[group_idx]
+
+        if len(group_shap) <= 1:
+            consistency_score = 1.0
+        else:
+            similarity_matrix = cosine_similarity(group_shap)
+            np.fill_diagonal(similarity_matrix, np.nan)
+            consistency_score = np.nanmean(similarity_matrix)
+        consistency_scores.append(consistency_score)
+
+    explanation_consistency[feature] = consistency_scores
+
+    priv_train = privileged_groups_train[feature]
+    priv_test = privileged_groups_test[feature]
+    print(f"\n{feature} group explanation consistency:")
+    print(f"  - Training Privileged Group: {priv_train}")
+    print(f"  - Test Privileged Group: {priv_test}")
+
+    for group, score in zip(groups, consistency_scores):
+        status = []
+        if group == priv_train:
+            status.append("TRAIN-PRIV")
+        if group == priv_test:
+            status.append("TEST-PRIV")
+        status_str = "[" + ", ".join(status) + "]" if status else ""
+        print(f"- Group {group} {status_str}: {score:.4f}")
+
+# ===================================================
+# Scientific Interpretation with CI
+# ===================================================
+print("="*80)
+print("SCIENTIFIC INTERPRETATION WITH 95% CONFIDENCE INTERVALS")
+print("="*80)
+
+print("\n1. PERFORMANCE ANALYSIS:")
+print("-"*60)
+print("Cross-Validation Performance (95% CI):")
+for metric, ci in perf_ci.items():
+    print(f"  - {metric}: {ci['mean']:.4f} ({ci['lower']:.4f}-{ci['upper']:.4f})")
+
+print("\nValidation Set Performance:")
+for metric, value in val_metrics.items():
+    print(f"  - {metric}: {value:.4f}")
+
+print("\nTest Set Performance:")
+for metric, value in test_metrics.items():
+    print(f"  - {metric}: {value:.4f}")
+
+print("\n2. FAIRNESS ASSESSMENT:")
+print("-"*60)
+print("Cross-Validation Fairness (95% CI):")
+for feat, metrics in fairness_ci.items():
+    print(f"\nSensitive Feature: {feat} (Training Privileged: {privileged_groups_train[feat]})")
+    for metric, ci in metrics.items():
+        print(f"  - {metric}: {ci['mean']:.4f} ({ci['lower']:.4f}-{ci['upper']:.4f})")
+
+print("\nTest Set Fairness Metrics:")
+for feature, results in test_fairness.items():
+    print(f"\nSensitive Feature: {feature}")
+    print(f"  - Training Privileged Group: {privileged_groups_train[feature]}")
+    print(f"  - Test Privileged Group: {privileged_groups_test[feature]}")
+    print(f"  - Equal Opportunity Difference: {results['Equal_Opportunity_Diff']:.4f}")
+    print(f"  - Statistical Parity Difference: {results['Statistical_Parity_Diff']:.4f}")
+    print(f"  - Fairness Ratio: {results['Fairness_Ratio']:.4f}")
+    print(f"  - Equalised Odds Difference: {results['Equalised_Odds_Difference']:.4f}")
+
+print("\n3. EXPLANATION FAIRNESS ASSESSMENT:")
+print("-"*60)
+print("Key findings from explanation fairness analysis:")
+for feature in sensitive_features:
+    print(f"\n>> {feature}:")
+    print(f"  - Training Privileged Group: {privileged_groups_train[feature]}")
+    print(f"  - Test Privileged Group: {privileged_groups_test[feature]}")
+
+    groups = X_test[feature].unique()
+    consistency_scores = explanation_consistency[feature]
+    priv_train = privileged_groups_train[feature]
+    priv_test = privileged_groups_test[feature]
+
+    min_consistency = min(consistency_scores)
+    max_consistency = max(consistency_scores)
+    overall_gap = max_consistency - min_consistency
+
+    if priv_train in groups:
+        priv_train_idx = np.where(groups == priv_train)[0][0]
+        priv_train_consistency = consistency_scores[priv_train_idx]
+        print(f"  - SHAP Training Privileged Consistency: {priv_train_consistency:.4f}")
+    else:
+        print(f"  - Training privileged group '{priv_train}' not found in test set")
+        priv_train_consistency = None
+
+    if priv_test in groups:
+        priv_test_idx = np.where(groups == priv_test)[0][0]
+        priv_test_consistency = consistency_scores[priv_test_idx]
+        print(f"  - SHAP Test Privileged Consistency: {priv_test_consistency:.4f}")
+    else:
+        print(f"  - Test privileged group '{priv_test}' not found in test set")
+        priv_test_consistency = None
+
+    print(f"  - SHAP Minimum Consistency: {min_consistency:.4f}")
+    print(f"  - SHAP Maximum Consistency: {max_consistency:.4f}")
+    print(f"  - SHAP Overall Consistency Gap: {overall_gap:.4f}")
+
+    if priv_train_consistency is not None:
+        train_gap = priv_train_consistency - min_consistency
+        print(f"  - SHAP Training Privileged Gap: {train_gap:.4f}")
+
+    if priv_test_consistency is not None:
+        test_gap = priv_test_consistency - min_consistency
+        print(f"  - SHAP Test Privileged Gap: {test_gap:.4f}")
+
+# ===================================================
+# SHAP Consistency Gap Analysis
+# ===================================================
+print("\n" + "="*80)
+print("SHAP CONSISTENCY GAP ANALYSIS")
+print("="*80)
+
+shap_consistency_gap_showed = False
+
+for feature in sensitive_features:
+    groups = X_test[feature].unique()
+    consistency_scores = explanation_consistency[feature]
+    min_consistency = min(consistency_scores)
+    max_consistency = max(consistency_scores)
+    overall_gap = max_consistency - min_consistency
+
+    print(f"\n{feature}:")
+    print(f"  - SHAP Minimum Consistency: {min_consistency:.4f}")
+    print(f"  - SHAP Maximum Consistency: {max_consistency:.4f}")
+    print(f"  - SHAP Overall Consistency Gap: {overall_gap:.4f}")
+
+    if overall_gap > 0.05:  # Significant gap threshold
+        shap_consistency_gap_showed = True
+        print("  ➤ SIGNIFICANT SHAP CONSISTENCY GAP DETECTED")
+    else:
+        print("  ➤ No significant SHAP consistency gap detected")
+
+print("\n" + "="*80)
+print("OVERALL CONCLUSION ON SHAP CONSISTENCY GAP")
+print("="*80)
+if shap_consistency_gap_showed:
+    print("YES, the analysis showed significant SHAP Consistency Gap")
+    print("• Different demographic groups received explanations with varying consistency")
+    print("• The gap between the most and least consistent groups exceeded 0.05")
+    print("• This indicates potential fairness issues in model explanations")
+else:
+    print("NO significant SHAP Consistency Gap was detected")
+    print("• Explanations were reasonably consistent across demographic groups")
+    print("• The gap between the most and least consistent groups was below 0.05")
+    print("• Model explanations show consistent behavior across protected attributes")
+
+print("\nRecommendations:")
+print("- For significant gaps: Implement explanation-aware fairness constraints")
+print("- Monitor SHAP consistency regularly as part of model audits")
+print("- Consider using adversarial training to align explanations across groups")
+print("- Set explanation consistency thresholds in model deployment standards")
+
+
+----------------END--------------------------------------------
+---------MOO for TabNet---------------------------------------
+
+# ===================================================
+# Import Required Libraries
+# ===================================================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from pytorch_tabnet.tab_model import TabNetClassifier  # Changed to TabNet
+import torch
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                            f1_score, roc_auc_score, log_loss,
+                            brier_score_loss, matthews_corrcoef,
+                            confusion_matrix, roc_curve, auc)
+from imblearn.over_sampling import BorderlineSMOTE
+import shap
+from scipy import stats
+import warnings
+import optuna
+from optuna.samplers import NSGAIISampler
+from sklearn.metrics.pairwise import cosine_similarity
+from mpl_toolkits.mplot3d import Axes3D  # For 3D plotting
+
+warnings.filterwarnings('ignore')
+
+# Set global parameters
+np.random.seed(42)
+torch.manual_seed(42)  # Added for TabNet reproducibility
+sns.set(style="whitegrid", font_scale=1.2)
+plt.rcParams['figure.figsize'] = (12, 8)
+shap.initjs()
+
+# ===================================================
+# Data Loading and Stratified Splitting (80:10:10)
+# ===================================================
+# Load dataset
+df = pd.read_csv('wrangledbank.csv')
+X = df.drop('y', axis=1)
+y = df['y']
+
+# Convert integer columns to float to avoid SMOTE casting error
+int_cols = X.select_dtypes(include=['int', 'int32', 'int64']).columns
+if len(int_cols) > 0:
+    print(f"Converting integer columns to float: {list(int_cols)}")
+    X[int_cols] = X[int_cols].astype(np.float64)
+
+# First split: 80% training, 20% temporary test
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# Second split: 10% validation, 10% test (50% of 20%)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp, test_size=0.5, stratify=y_temp, random_state=42
+)
+
+print("="*80)
+print("Stratified Split Distribution")
+print("="*80)
+print(f"Training set: {X_train.shape[0]} samples (Positive: {y_train.sum()}, {y_train.mean():.2%})")
+print(f"Validation set: {X_val.shape[0]} samples (Positive: {y_val.sum()}, {y_val.mean():.2%})")
+print(f"Testing set: {X_test.shape[0]} samples (Positive: {y_test.sum()}, {y_test.mean():.2%})")
+
+# Identify sensitive features
+sensitive_features = ['agecat', 'marital', 'education']
+
+# Determine privileged groups from training data
+privileged_groups_train = {}
+for feat in sensitive_features:
+    privileged_groups_train[feat] = X_train[feat].mode()[0]
+
+# Determine privileged groups from test data
+privileged_groups_test = {}
+for feat in sensitive_features:
+    privileged_groups_test[feat] = X_test[feat].mode()[0]
+
+print("\nPrivileged groups determined from training data:")
+for feat, val in privileged_groups_train.items():
+    print(f"- {feat}: {val}")
+
+print("\nPrivileged groups determined from test data:")
+for feat, val in privileged_groups_test.items():
+    print(f"- {feat}: {val}")
+
+# ===================================================
+# Apply Borderline-SMOTE to Training Data (FIXED)
+# ===================================================
+print("="*80)
+print("Applying Borderline-SMOTE to Training Data")
+print("="*80)
+print(f"Before SMOTE: Class 0 = {sum(y_train == 0)}, Class 1 = {sum(y_train == 1)}")
+
+# Store pre-SMOTE privileged groups and distributions
+pre_smote_privileged = privileged_groups_train.copy()
+pre_smote_distributions = {}
+for feat in sensitive_features:
+    pre_smote_distributions[feat] = X_train[feat].value_counts(normalize=True).to_dict()
+
+smote = BorderlineSMOTE(sampling_strategy='auto', kind='borderline-2', random_state=42)
+X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+
+# Convert back to DataFrame with proper column names and data types (CRITICAL FIX)
+X_train_res = pd.DataFrame(X_train_res, columns=X_train.columns)
+for col in X_train.columns:
+    X_train_res[col] = X_train_res[col].astype(X_train[col].dtype)
+
+print(f"After SMOTE: Class 0 = {sum(y_train_res == 0)}, Class 1 = {sum(y_train_res == 1)}")
+
+# ===================================================
+# Comparative Analysis: Privileged Groups Before/After SMOTE (FIXED)
+# ===================================================
+print("="*80)
+print("Privileged Group Analysis: Before vs After SMOTE")
+print("="*80)
+
+# Determine privileged groups from resampled data
+post_smote_privileged = {}
+post_smote_distributions = {}
+for feat in sensitive_features:
+    # Get the most frequent category in resampled data
+    post_smote_privileged[feat] = X_train_res[feat].mode()[0]
+    # Get distribution
+    post_smote_distributions[feat] = X_train_res[feat].value_counts(normalize=True).to_dict()
+
+# Create comparison table
+comparison_data = []
+for feat in sensitive_features:
+    pre_mode = pre_smote_privileged[feat]
+    post_mode = post_smote_privileged[feat]
+    changed = "YES" if pre_mode != post_mode else "NO"
+
+    # Calculate bias change metrics
+    pre_rep = pre_smote_distributions[feat].get(pre_mode, 0)
+    post_rep = post_smote_distributions[feat].get(post_mode, 0)
+    rep_change = post_rep - pre_rep
+
+    # Calculate Gini coefficient for bias measurement
+    def gini_coeff(values):
+        sorted_vals = np.sort(np.array(list(values)))
+        n = len(sorted_vals)
+        index = np.arange(1, n+1)
+        return (np.sum((2 * index - n - 1) * sorted_vals)) / (n * np.sum(sorted_vals))
+
+    pre_gini = gini_coeff(list(pre_smote_distributions[feat].values()))
+    post_gini = gini_coeff(list(post_smote_distributions[feat].values()))
+    gini_change = post_gini - pre_gini
+
+    comparison_data.append({
+        'Feature': feat,
+        'Pre-SMOTE Privileged': pre_mode,
+        'Post-SMOTE Privileged': post_mode,
+        'Changed': changed,
+        'Pre-SMOTE Representation': f"{pre_rep:.2%}",
+        'Post-SMOTE Representation': f"{post_rep:.2%}",
+        'Representation Change': f"{rep_change:+.2f}",
+        'Pre-SMOTE Gini': f"{pre_gini:.4f}",
+        'Post-SMOTE Gini': f"{post_gini:.4f}",
+        'Gini Change': f"{gini_change:+.4f}",
+        'Bias Status': "Reduced" if gini_change < 0 else "Increased"
+    })
+
+# Create and display comparison DataFrame
+comparison_df = pd.DataFrame(comparison_data)
+print("\nPrivileged Group Comparison:")
+print(comparison_df.to_string(index=False))
+
+# Visualization: Distribution changes (FIXED)
+fig, axes = plt.subplots(len(sensitive_features), 2, figsize=(16, 6*len(sensitive_features)))
+for i, feat in enumerate(sensitive_features):
+    # Pre-SMOTE distribution
+    ax1 = axes[i, 0] if len(sensitive_features) > 1 else axes[0]
+    pre_dist = pre_smote_distributions[feat]
+    pre_categories = list(pre_dist.keys())
+    pre_values = list(pre_dist.values())
+    sns.barplot(x=pre_categories, y=pre_values, ax=ax1, palette='viridis')
+    ax1.axhline(y=1/len(pre_dist), color='r', linestyle='--', alpha=0.7)
+    ax1.set_title(f'Pre-SMOTE Distribution: {feat}\nPrivileged: {pre_smote_privileged[feat]}')
+    ax1.set_ylim(0, 1)
+    ax1.tick_params(axis='x', rotation=45)
+
+    # Post-SMOTE distribution
+    ax2 = axes[i, 1] if len(sensitive_features) > 1 else axes[1]
+    post_dist = post_smote_distributions[feat]
+    post_categories = list(post_dist.keys())
+    post_values = list(post_dist.values())
+    sns.barplot(x=post_categories, y=post_values, ax=ax2, palette='viridis')
+    ax2.axhline(y=1/len(post_dist), color='r', linestyle='--', alpha=0.7)
+    ax2.set_title(f'Post-SMOTE Distribution: {feat}\nPrivileged: {post_smote_privileged[feat]}')
+    ax2.set_ylim(0, 1)
+    ax2.tick_params(axis='x', rotation=45)
+
+plt.tight_layout()
+plt.suptitle('Sensitive Feature Distribution: Before vs After SMOTE', y=1.02, fontsize=16)
+plt.show()
+
+# Bias change analysis
+print("\nBias Change Analysis:")
+for feat in sensitive_features:
+    pre_gini = float(comparison_df[comparison_df['Feature'] == feat]['Pre-SMOTE Gini'].values[0][:-1])
+    post_gini = float(comparison_df[comparison_df['Feature'] == feat]['Post-SMOTE Gini'].values[0][:-1])
+
+    print(f"\n{feat}:")
+    print(f"  - Pre-SMOTE Gini: {pre_gini:.4f} ({'High bias' if pre_gini > 0.3 else 'Moderate bias' if pre_gini > 0.2 else 'Low bias'})")
+    print(f"  - Post-SMOTE Gini: {post_gini:.4f} ({'High bias' if post_gini > 0.3 else 'Moderate bias' if post_gini > 0.2 else 'Low bias'})")
+    print(f"  - Change: {post_gini - pre_gini:+.4f}")
+
+    if abs(post_gini - pre_gini) < 0.05:
+        print("  ➤ SMOTE had minimal impact on representation bias")
+    elif post_gini < pre_gini:
+        print("  ➤ SMOTE REDUCED representation bias for this feature")
+    else:
+        print("  ➤ SMOTE INCREASED representation bias for this feature")
+
+# Update privileged groups for downstream use
+privileged_groups_train = post_smote_privileged.copy()
+
+# ===================================================
+# Fixed calculate_fairness_metrics_full function
+# ===================================================
+def calculate_fairness_metrics_full(X_data, y_data, y_pred, sensitive_feature):
+    groups = X_data[sensitive_feature].unique()
+    tprs = []
+    fprs = []
+    parity_rates = []
+
+    for group in groups:
+        group_idx = X_data[sensitive_feature] == group
+        group_y_data = y_data[group_idx]
+        group_y_pred = y_pred[group_idx]
+
+        if len(group_y_data) == 0:
+            continue
+
+        # Calculate TPR (recall)
+        group_tpr = recall_score(group_y_data, group_y_pred, zero_division=0)
+        tprs.append(group_tpr)
+
+        # Calculate FPR with proper handling
+        try:
+            # Use labels to ensure 2x2 matrix even with single class
+            cm = confusion_matrix(group_y_data, group_y_pred, labels=[0, 1])
+            tn, fp, fn, tp = cm.ravel()
+            group_fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+        except ValueError:
+            # Fallback in case of issues
+            group_fpr = 0
+        fprs.append(group_fpr)
+
+        # Calculate positive prediction rate
+        group_parity = group_y_pred.mean()
+        parity_rates.append(group_parity)
+
+    # Handle cases with no valid groups
+    if not tprs:
+        tprs = [0]
+    if not parity_rates:
+        parity_rates = [0]
+    if not fprs:
+        fprs = [0]
+
+    # FIX: Ensure we have at least 2 groups for differences
+    eod = max(tprs) - min(tprs) if len(tprs) > 1 else 0
+    spd = max(parity_rates) - min(parity_rates) if len(parity_rates) > 1 else 0
+    eodd = (max(tprs) - min(tprs)) + (max(fprs) - min(fprs)) if (len(tprs) > 1 and len(fprs) > 1) else 0
+    fairness_ratio = eod / spd if spd != 0 else 0
+
+    return {
+        'TPR': tprs,
+        'FPR': fprs,
+        'Parity_Rate': parity_rates,
+        'Equal_Opportunity_Diff': eod,
+        'Statistical_Parity_Diff': spd,
+        'Equalised_Odds_Difference': eodd,
+        'Fairness_Ratio': fairness_ratio
+    }
+
+# ===================================================
+# SHAP Consistency Calculation Function for TabNet
+# ===================================================
+def calculate_shap_consistency_gap_tabnet(model, X_sample, sensitive_features):
+    """Calculate max SHAP consistency gap across sensitive features for TabNet"""
+    # Use KernelExplainer for TabNet
+    explainer = shap.KernelExplainer(model.predict_proba, X_sample.sample(50, random_state=42))
+    shap_values = explainer.shap_values(X_sample, silent=True)
+
+    # Use SHAP values for positive class
+    if isinstance(shap_values, list):
+        shap_values = shap_values[1]  # For binary classification
+    else:
+        shap_values = shap_values[:, :, 1] if len(shap_values.shape) == 3 else shap_values
+
+    n_samples_shap = shap_values.shape[0]
+    max_gap = 0
+
+    for feat in sensitive_features:
+        groups = X_sample[feat].unique()
+        group_consistencies = []
+
+        for group in groups:
+            # Create boolean mask for group
+            group_mask = (X_sample[feat] == group).values
+
+            # Trim mask to match SHAP values length if needed
+            if len(group_mask) > n_samples_shap:
+                group_mask = group_mask[:n_samples_shap]
+
+            # Only proceed if we have samples to process
+            if group_mask.sum() == 0:
+                continue
+
+            group_shap = shap_values[group_mask]
+
+            # Skip if not enough samples for similarity calculation
+            if len(group_shap) < 2:
+                continue
+
+            # Ensure array is 2D before cosine similarity
+            if len(group_shap.shape) > 2:
+                group_shap = group_shap.reshape(group_shap.shape[0], -1)
+
+            # Compute pairwise cosine similarities
+            sim_matrix = cosine_similarity(group_shap)
+            np.fill_diagonal(sim_matrix, np.nan)
+            group_consistency = np.nanmean(sim_matrix)
+            group_consistencies.append(group_consistency)
+
+        if len(group_consistencies) < 2:
+            continue
+
+        gap = max(group_consistencies) - min(group_consistencies)
+        if gap > max_gap:
+            max_gap = gap
+
+    return max_gap
+
+# ===================================================
+# OPTUNA Multi-Objective Hyperparameter Optimization with NSGA-II Sampler (TabNet)
+# ===================================================
+print("\n" + "="*80)
+print("Starting Multi-Objective OPTUNA Hyperparameter Optimization with NSGA-II (TabNet)")
+print("="*80)
+
+def objective(trial):
+    """Objective function for multi-objective Optuna optimization (TabNet)"""
+    # Suggest TabNet hyperparameters
+    params = {
+        'n_d': trial.suggest_categorical('n_d', [8, 16, 24, 32]),
+        'n_a': trial.suggest_categorical('n_a', [8, 16, 24, 32]),
+        'n_steps': trial.suggest_int('n_steps', 3, 7),
+        'gamma': trial.suggest_float('gamma', 1.0, 2.0, step=0.1),
+        'lambda_sparse': trial.suggest_float('lambda_sparse', 1e-4, 0.01, log=True),
+        'lr': trial.suggest_float('lr', 1e-3, 0.1, log=True),
+        'batch_size': trial.suggest_categorical('batch_size', [256, 512, 1024]),
+        'virtual_batch_size': trial.suggest_categorical('virtual_batch_size', [64, 128, 256])
+    }
+
+    # Use 3-fold CV for optimization
+    n_folds = 3
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+    mcc_scores = []
+    eodd_scores = []
+    shap_gap_scores = []
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_res, y_train_res)):
+        print(f"  > Fold {fold+1}/{n_folds}")
+        X_fold_train, X_fold_val = X_train_res.iloc[train_idx], X_train_res.iloc[val_idx]
+        y_fold_train, y_fold_val = y_train_res.iloc[train_idx], y_train_res.iloc[val_idx]
+
+        # Convert to numpy for TabNet
+        X_fold_train_np = X_fold_train.values
+        y_fold_train_np = y_fold_train.values
+        X_fold_val_np = X_fold_val.values
+
+        # Create TabNet model with suggested parameters
+        model = TabNetClassifier(
+            n_d=params['n_d'],
+            n_a=params['n_a'],
+            n_steps=params['n_steps'],
+            gamma=params['gamma'],
+            lambda_sparse=params['lambda_sparse'],
+            optimizer_fn=torch.optim.Adam,
+            optimizer_params=dict(lr=params['lr']),
+            scheduler_params=dict(mode="min", patience=5, min_lr=1e-5, factor=0.9),
+            scheduler_fn=torch.optim.lr_scheduler.ReduceLROnPlateau,
+            mask_type='sparsemax',
+            device_name='cuda' if torch.cuda.is_available() else 'cpu',
+            seed=42,
+            verbose=0
+        )
+
+        # Train model
+        model.fit(
+            X_fold_train_np, y_fold_train_np,
+            eval_set=[(X_fold_val_np, y_fold_val.values)],
+            eval_name=['val'],
+            eval_metric=['auc'],
+            max_epochs=100,
+            patience=10,
+            batch_size=params['batch_size'],
+            virtual_batch_size=params['virtual_batch_size'],
+            num_workers=0,
+            drop_last=False,
+            loss_fn=torch.nn.functional.cross_entropy
+        )
+
+        # Performance: MCC
+        y_pred_val = model.predict(X_fold_val_np)
+        mcc = matthews_corrcoef(y_fold_val, y_pred_val)
+        mcc_scores.append(mcc)
+
+        # Fairness: 1 - EODD (maximize fairness = minimize EODD)
+        avg_eodd = 0
+        valid_features = 0
+        for feat in sensitive_features:
+            try:
+                fairness = calculate_fairness_metrics_full(X_fold_val, y_fold_val, y_pred_val, feat)
+                avg_eodd += fairness['Equalised_Odds_Difference']
+                valid_features += 1
+            except Exception as e:
+                print(f"Fairness calculation error for {feat}: {str(e)}")
+                continue
+
+        if valid_features > 0:
+            avg_eodd /= valid_features
+        else:
+            avg_eodd = 0
+        eodd_scores.append(avg_eodd)
+
+        # Explainability: 1 - SHAP_Consistency_Gap
+        # Sample 100 instances for SHAP computation
+        if len(X_fold_val) > 100:
+            sample_indices = np.random.choice(X_fold_val.index, 100, replace=False)
+            X_sample = X_fold_val.loc[sample_indices]
+        else:
+            X_sample = X_fold_val
+
+        shap_gap = calculate_shap_consistency_gap_tabnet(model, X_sample, sensitive_features)
+        shap_gap_scores.append(shap_gap)
+
+    # Aggregate scores across folds
+    avg_mcc = np.mean(mcc_scores)
+    avg_eodd = np.mean(eodd_scores)
+    avg_shap_gap = np.mean(shap_gap_scores)
+
+    # Return objectives: maximize MCC, maximize (1 - EODD), maximize (1 - SHAP_Gap)
+    return avg_mcc, 1 - avg_eodd, 1 - avg_shap_gap
+
+# Create Optuna study with NSGA-II sampler
+study = optuna.create_study(
+    directions=['maximize', 'maximize', 'maximize'],
+    sampler=NSGAIISampler(seed=42),
+    pruner=None
+)
+
+# Optimize with 20 trials
+study.optimize(objective, n_trials=2, show_progress_bar=True)
+
+print("\n" + "="*80)
+print("Multi-Objective Optimization Complete")
+print("="*80)
+print(f"Number of trials: {len(study.trials)}")
+print(f"Number of non-dominated solutions: {len(study.best_trials)}")
+
+# ===================================================
+# SIMPLE 3D Pareto Front Visualization (Matplotlib)
+# ===================================================
+print("\nGenerating Simple 3D Pareto Front Visualization...")
+
+# Prepare data for plotting
+mcc_vals = []
+fairness_vals = []
+explainability_vals = []
+composite_scores = []  # Store composite scores
+
+for trial in study.best_trials:
+    mcc, fairness, explainability = trial.values
+    mcc_vals.append(mcc)
+    fairness_vals.append(fairness)
+    explainability_vals.append(explainability)
+
+    # SIMPLE COMPOSITE SCORE: Weighted average
+    composite_score = (0.5 * mcc) + (0.3 * fairness) + (0.2 * explainability)
+    composite_scores.append(composite_score)
+
+# Create 3D plot
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(111, projection='3d')
+
+# Plot all Pareto solutions
+sc = ax.scatter(mcc_vals, fairness_vals, explainability_vals,
+                c=composite_scores, cmap='viridis', s=100)
+
+# Find best solution (highest composite score)
+best_idx = np.argmax(composite_scores)
+
+# Highlight best solution
+ax.scatter(mcc_vals[best_idx], fairness_vals[best_idx], explainability_vals[best_idx],
+           c='red', marker='*', s=300, label='Best Solution')
+
+# Add labels
+ax.set_xlabel('Performance (MCC)')
+ax.set_ylabel('Fairness (1 - EODD)')
+ax.set_zlabel('Explainability (1 - SHAP Gap)')
+ax.set_title('3D Pareto Front')
+
+# Add colorbar for composite score
+cbar = fig.colorbar(sc)
+cbar.set_label('Composite Score')
+
+# Add legend
+ax.legend()
+
+plt.tight_layout()
+plt.show()
+
+# ===================================================
+# Select Best Trial (Highest Composite Score)
+# ===================================================
+best_trial = study.best_trials[best_idx]
+best_params = best_trial.params
+print("\n" + "="*80)
+print("Selected Best Solution (Highest Composite Score)")
+print("="*80)
+print(f"Performance (MCC): {best_trial.values[0]:.4f}")
+print(f"Fairness (1 - EODD): {best_trial.values[1]:.4f}")
+print(f"Explainability (1 - SHAP Gap): {best_trial.values[2]:.4f}")
+print(f"Composite Score: {composite_scores[best_idx]:.4f} (weighted average)")
+print("\nBest Parameters:")
+for key, value in best_params.items():
+    print(f"- {key}: {value}")
+
+# ===================================================
+# Visualization: Optimization History
+# ===================================================
+print("\nGenerating Optimization History Plots...")
+
+# MCC History
+mcc_history = [t.values[0] for t in study.trials if t.values is not None]
+plt.figure(figsize=(10, 6))
+plt.plot(mcc_history, 'b-', alpha=0.3)
+plt.scatter(range(len(mcc_history)), mcc_history, s=20, alpha=0.8)
+plt.title('Optimization History: Performance (MCC)')
+plt.xlabel('Trial')
+plt.ylabel('MCC Score')
+plt.grid(True)
+plt.show()
+
+# Fairness History
+fairness_history = [t.values[1] for t in study.trials if t.values is not None]
+plt.figure(figsize=(10, 6))
+plt.plot(fairness_history, 'g-', alpha=0.3)
+plt.scatter(range(len(fairness_history)), fairness_history, s=20, alpha=0.8)
+plt.title('Optimization History: Fairness (1 - EODD)')
+plt.xlabel('Trial')
+plt.ylabel('Fairness Score')
+plt.grid(True)
+plt.show()
+
+# Explainability History
+explainability_history = [t.values[2] for t in study.trials if t.values is not None]
+plt.figure(figsize=(10, 6))
+plt.plot(explainability_history, 'r-', alpha=0.3)
+plt.scatter(range(len(explainability_history)), explainability_history, s=20, alpha=0.8)
+plt.title('Optimization History: Explainability (1 - SHAP Gap)')
+plt.xlabel('Trial')
+plt.ylabel('Explainability Score')
+plt.grid(True)
+plt.show()
+
+# ===================================================
+# Cross-Validation Setup (CV=5) with Optimized Parameters
+# ===================================================
+n_folds = 5
+skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+# Initialize performance metrics dictionary
+cv_performance = {metric: [] for metric in ['Accuracy', 'Precision', 'Recall', 'F1', 'MCC','AUC']}
+cv_fairness = {feat: {'Equal_Opportunity_Diff': [], 'Statistical_Parity_Diff': [], 'Equalised_Odds_Difference': [], 'Fairness_Ratio': []}
+               for feat in sensitive_features}
+
+# ===================================================
+# Cross-Validation for Performance and Fairness
+# ===================================================
+print("="*80)
+print(f"Performing {n_folds}-fold Cross-Validation with Optimized TabNet")
+print("="*80)
+
+for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_res, y_train_res)):
+    print(f"\n>> Fold {fold+1}/{n_folds}")
+
+    X_fold_train, X_fold_val = X_train_res.iloc[train_idx], X_train_res.iloc[val_idx]
+    y_fold_train, y_fold_val = y_train_res.iloc[train_idx], y_train_res.iloc[val_idx]
+
+    # Convert to numpy for TabNet
+    X_fold_train_np = X_fold_train.values
+    y_fold_train_np = y_fold_train.values
+    X_fold_val_np = X_fold_val.values
+
+    # Create TabNet model with best parameters
+    tabnet_model = TabNetClassifier(
+        n_d=best_params['n_d'],
+        n_a=best_params['n_a'],
+        n_steps=best_params['n_steps'],
+        gamma=best_params['gamma'],
+        lambda_sparse=best_params['lambda_sparse'],
+        optimizer_fn=torch.optim.Adam,
+        optimizer_params=dict(lr=best_params['lr']),
+        scheduler_params=dict(mode="min", patience=5, min_lr=1e-5, factor=0.9),
+        scheduler_fn=torch.optim.lr_scheduler.ReduceLROnPlateau,
+        mask_type='sparsemax',
+        device_name='cuda' if torch.cuda.is_available() else 'cpu',
+        seed=42,
+        verbose=0
+    )
+
+    # Train model
+    tabnet_model.fit(
+        X_fold_train_np, y_fold_train_np,
+        eval_set=[(X_fold_val_np, y_fold_val.values)],
+        eval_name=['val'],
+        eval_metric=['auc'],
+        max_epochs=100,
+        patience=10,
+        batch_size=best_params['batch_size'],
+        virtual_batch_size=best_params['virtual_batch_size'],
+        num_workers=0,
+        drop_last=False,
+        loss_fn=torch.nn.functional.cross_entropy
+    )
+
+    y_pred_val = tabnet_model.predict(X_fold_val_np)
+    y_pred_proba_val = tabnet_model.predict_proba(X_fold_val_np)[:, 1]
+
+    cv_performance['Accuracy'].append(accuracy_score(y_fold_val, y_pred_val))
+    cv_performance['Precision'].append(precision_score(y_fold_val, y_pred_val))
+    cv_performance['Recall'].append(recall_score(y_fold_val, y_pred_val))
+    cv_performance['F1'].append(f1_score(y_fold_val, y_pred_val))
+    cv_performance['MCC'].append(matthews_corrcoef(y_fold_val, y_pred_val))
+    cv_performance['AUC'].append(roc_auc_score(y_fold_val, y_pred_proba_val))
+
+    for feat in sensitive_features:
+        fairness = calculate_fairness_metrics_full(X_fold_val, y_fold_val, y_pred_val, feat)
+        cv_fairness[feat]['Equal_Opportunity_Diff'].append(fairness['Equal_Opportunity_Diff'])
+        cv_fairness[feat]['Statistical_Parity_Diff'].append(fairness['Statistical_Parity_Diff'])
+        cv_fairness[feat]['Equalised_Odds_Difference'].append(fairness['Equalised_Odds_Difference'])
+        cv_fairness[feat]['Fairness_Ratio'].append(fairness['Fairness_Ratio'])
+
+# ===================================================
+# Calculate Confidence Intervals (95%)
+# ===================================================
+def calculate_ci(data, confidence=0.95):
+    a = 1.0 * np.array(data)
+    n = len(a)
+    m, se = np.mean(a), stats.sem(a)
+    h = se * stats.t.ppf((1 + confidence) / 2., n-1)
+    return m, m-h, m+h
+
+perf_ci = {}
+for metric, values in cv_performance.items():
+    mean, lower, upper = calculate_ci(values)
+    perf_ci[metric] = {'mean': mean, 'lower': lower, 'upper': upper}
+
+fairness_ci = {}
+for feat, metrics in cv_fairness.items():
+    fairness_ci[feat] = {}
+    for metric, values in metrics.items():
+        mean, lower, upper = calculate_ci(values)
+        fairness_ci[feat][metric] = {'mean': mean, 'lower': lower, 'upper': upper}
+
+# ===================================================
+# Final Model Training on Full Training Set
+# ===================================================
+print("="*80)
+print("Training Final Optimized TabNet on Balanced Data")
+print("="*80)
+
+# Convert to numpy for TabNet
+X_train_res_np = X_train_res.values
+y_train_res_np = y_train_res.values
+X_val_np = X_val.values
+y_val_np = y_val.values
+
+tabnet_final = TabNetClassifier(
+    n_d=best_params['n_d'],
+    n_a=best_params['n_a'],
+    n_steps=best_params['n_steps'],
+    gamma=best_params['gamma'],
+    lambda_sparse=best_params['lambda_sparse'],
+    optimizer_fn=torch.optim.Adam,
+    optimizer_params=dict(lr=best_params['lr']),
+    scheduler_params=dict(mode="min", patience=5, min_lr=1e-5, factor=0.9),
+    scheduler_fn=torch.optim.lr_scheduler.ReduceLROnPlateau,
+    mask_type='sparsemax',
+    device_name='cuda' if torch.cuda.is_available() else 'cpu',
+    seed=42,
+    verbose=1
+)
+
+tabnet_final.fit(
+    X_train_res_np, y_train_res_np,
+    eval_set=[(X_val_np, y_val_np)],
+    eval_name=['val'],
+    eval_metric=['auc'],
+    max_epochs=100,
+    patience=10,
+    batch_size=best_params['batch_size'],
+    virtual_batch_size=best_params['virtual_batch_size'],
+    num_workers=0,
+    drop_last=False,
+    loss_fn=torch.nn.functional.cross_entropy
+)
+
+# ===================================================
+# Performance Evaluation on Validation and Test Sets
+# ===================================================
+def evaluate_performance(model, X, y, set_name):
+    X_np = X.values
+    y_pred = model.predict(X_np)
+    y_pred_proba = model.predict_proba(X_np)[:, 1]
+
+    return {
+        'Accuracy': accuracy_score(y, y_pred),
+        'Precision': precision_score(y, y_pred),
+        'Recall': recall_score(y, y_pred),
+        'F1': f1_score(y, y_pred),
+        'MCC': matthews_corrcoef(y, y_pred),
+        'AUC': roc_auc_score(y, y_pred_proba),
+        'Log Loss': log_loss(y, y_pred_proba),
+        'Brier Score': brier_score_loss(y, y_pred_proba)
+    }
+
+val_metrics = evaluate_performance(tabnet_final, X_val, y_val, "Validation")
+test_metrics = evaluate_performance(tabnet_final, X_test, y_test, "Test")
+
+print("="*80)
+print("Validation Set Performance Metrics")
+print("="*80)
+for metric, value in val_metrics.items():
+    print(f"{metric}: {value:.4f}")
+
+print("\n" + "="*80)
+print("Test Set Performance Metrics")
+print("="*80)
+for metric, value in test_metrics.items():
+    print(f"{metric}: {value:.4f}")
+
+X_test_np = X_test.values
+fpr, tpr, _ = roc_curve(y_test, tabnet_final.predict_proba(X_test_np)[:, 1])
+roc_auc = auc(fpr, tpr)
+
+plt.figure()
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Test Set Receiver Operating Characteristic')
+plt.legend(loc="lower right")
+plt.show()
+
+# ===================================================
+# Fairness Evaluation on Test Set (FIXED)
+# ===================================================
+X_test_np = X_test.values
+y_test_pred = tabnet_final.predict(X_test_np)
+test_fairness = {}
+for feature in sensitive_features:
+    test_fairness[feature] = calculate_fairness_metrics_full(X_test, y_test, y_test_pred, feature)
+
+print("="*80)
+print("Test Set Fairness Metrics")
+print("="*80)
+for feature, results in test_fairness.items():
+    print(f"\nSensitive Feature: {feature}")
+    print(f"  - Training Privileged Group: {privileged_groups_train[feature]}")
+    print(f"  - Test Privileged Group: {privileged_groups_test[feature]}")
+    print(f"  - Equal Opportunity Difference: {results['Equal_Opportunity_Diff']:.4f}")
+    print(f"  - Statistical Parity Difference: {results['Statistical_Parity_Diff']:.4f}")
+    print(f"  - Fairness Ratio: {results['Fairness_Ratio']:.4f}")
+    print(f"  - Equalised Odds Difference: {results['Equalised_Odds_Difference']:.4f}")
+
+fig, axes = plt.subplots(len(sensitive_features), 2, figsize=(15, 5*len(sensitive_features)))
+
+for i, feature in enumerate(sensitive_features):
+    priv_train = privileged_groups_train[feature]
+    priv_test = privileged_groups_test[feature]
+
+    ax1 = axes[i, 0] if len(sensitive_features) > 1 else axes[0]
+    groups = X_test[feature].unique()
+    tprs = test_fairness[feature]['TPR']
+
+    colors = []
+    for group in groups:
+        if group == priv_train and group == priv_test:
+            colors.append('purple')
+        elif group == priv_train:
+            colors.append('green')
+        elif group == priv_test:
+            colors.append('orange')
+        else:
+            colors.append('blue')
+
+    sns.barplot(x=groups, y=tprs, ax=ax1, palette=colors)
+    title = f'True Positive Rate by {feature}\n'
+    title += f'Train Priv: {priv_train}, Test Priv: {priv_test}'
+    ax1.set_title(title)
+    ax1.set_ylabel('TPR')
+    ax1.set_ylim(0, 1)
+
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='green', label='Training Privileged'),
+        Patch(facecolor='orange', label='Test Privileged'),
+        Patch(facecolor='purple', label='Both'),
+        Patch(facecolor='blue', label='Neither')
+    ]
+    ax1.legend(handles=legend_elements, loc='best')
+
+    ax2 = axes[i, 1] if len(sensitive_features) > 1 else axes[1]
+    parity_rates = test_fairness[feature]['Parity_Rate']
+
+    sns.barplot(x=groups, y=parity_rates, ax=ax2, palette=colors)
+    title = f'Positive Prediction Rate by {feature}\n'
+    title += f'Train Priv: {priv_train}, Test Priv: {priv_test}'
+    ax2.set_title(title)
+    ax2.set_ylabel('Prediction Rate')
+    ax2.set_ylim(0, 1)
+    ax2.legend(handles=legend_elements, loc='best')
+
+plt.tight_layout()
+plt.show()
+
+# ===================================================
+# SHAP Explainability Analysis on Test Set (TabNet)
+# ===================================================
+print("="*80)
+print("SHAP Explainability Analysis (TabNet)")
+print("="*80)
+
+# Optimized SHAP analysis using KernelExplainer with sampling
+background_samples = shap.sample(X_train_res, 50, random_state=42)
+test_samples = X_test.sample(100, random_state=42)
+
+# Use KernelExplainer for TabNet
+explainer = shap.KernelExplainer(tabnet_final.predict_proba, background_samples)
+shap_values = explainer.shap_values(test_samples)
+
+# Get values for positive class
+shap_values_positive = shap_values[..., 1]
+
+plt.figure(figsize=(12, 8))
+shap.summary_plot(shap_values_positive, test_samples, plot_type="bar")
+plt.title('TabNet: Global Feature Importance', fontsize=16)
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(12, 8))
+shap.summary_plot(shap_values_positive, test_samples)
+plt.title('TabNet: Feature Impact Direction', fontsize=16)
+plt.tight_layout()
+plt.show()
+
+mean_abs_shap = np.abs(shap_values_positive).mean(axis=0)
+mean_shap_df = pd.DataFrame({
+    'Feature': test_samples.columns,
+    'Mean |SHAP|': mean_abs_shap
+}).sort_values('Mean |SHAP|', ascending=False)
+
+print("\nSHAP Feature Importance:")
+print(mean_shap_df.round(4))
+
+print("\nIndividual Instance Explanations:")
+print("Sensitive Feature Analysis:")
+
+# Find samples with min/max age categories
+age_min = min(test_samples['agecat'])
+age_max = max(test_samples['agecat'])
+young_sample = test_samples.index[test_samples['agecat'] == age_min][0]
+old_sample = test_samples.index[test_samples['agecat'] == age_max][0]
+sensitive_samples = [young_sample, old_sample]
+
+for idx in sensitive_samples:
+    instance_idx = test_samples.index.get_loc(idx)
+    instance = test_samples.loc[idx]
+
+    # Waterfall plot
+    shap.plots.waterfall(
+        shap.Explanation(
+            values=shap_values_positive[instance_idx],
+            base_values=explainer.expected_value[1],
+            data=instance.values,
+            feature_names=test_samples.columns
+        )
+    )
+    plt.title(f'Waterfall Plot (Instance #{idx})', fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+    actual_class = y_test.loc[idx]
+    pred_class = tabnet_final.predict(instance.values.reshape(1, -1))[0]
+    print(f"Actual: {actual_class}, Predicted: {pred_class}")
+
+    print("Sensitive Feature Contributions:")
+    for feat in sensitive_features:
+        feat_idx = list(test_samples.columns).index(feat)
+        val = shap_values_positive[instance_idx, feat_idx]
+        orig_value = instance[feat]
+
+        is_train_priv = orig_value == privileged_groups_train[feat]
+        is_test_priv = orig_value == privileged_groups_test[feat]
+
+        status = ""
+        if is_train_priv and is_test_priv:
+            status = "[TRAIN & TEST PRIVILEGED]"
+        elif is_train_priv:
+            status = "[TRAIN PRIVILEGED]"
+        elif is_test_priv:
+            status = "[TEST PRIVILEGED]"
+
+        print(f"- {feat} ({orig_value}) {status}: {val:.4f}")
+
+# ===================================================
+# Explanation Fairness Analysis
+# ===================================================
+print("="*80)
+print("EXPLANATION FAIRNESS ANALYSIS")
+print("="*80)
+print("Evaluating if explanations are consistent across sensitive groups...")
+
+print("\n1. FEATURE IMPORTANCE FAIRNESS:")
+print("-"*60)
+print("Comparing feature importance distributions across groups:")
+
+# Get feature index mapping
+feature_index_map = {col: idx for idx, col in enumerate(test_samples.columns)}
+
+for feature in sensitive_features:
+    print(f"\n>> Sensitive Feature: {feature}")
+    priv_train = privileged_groups_train[feature]
+    priv_test = privileged_groups_test[feature]
+    groups = test_samples[feature].unique()
+
+    group_importances = {}
+    for group in groups:
+        group_idx = test_samples[feature] == group
+        group_shap = np.abs(shap_values_positive[group_idx]).mean(axis=0)
+        group_importances[group] = group_shap
+
+    importance_df = pd.DataFrame(group_importances, index=test_samples.columns)
+    importance_df['Std_Across_Groups'] = importance_df.std(axis=1)
+    importance_df['Max_Diff'] = importance_df.max(axis=1) - importance_df.min(axis=1)
+
+    print("\nTop features with highest variation across groups:")
+    print(importance_df.sort_values('Max_Diff', ascending=False).head(10).round(4))
+
+    top_features = importance_df.sort_values('Max_Diff', ascending=False).index[:3]
+    print("\nStatistical significance of differences (ANOVA):")
+    for feat in top_features:
+        group_data = [importance_df.loc[feat, group] for group in groups]
+        f_stat, p_value = stats.f_oneway(*group_data)
+        print(f"- {feat}: F-stat = {f_stat:.4f}, p-value = {p_value:.4f}")
+
+print("\n2. INDIVIDUAL EXPLANATION FAIRNESS:")
+print("-"*60)
+print("Comparing SHAP values for sensitive features across groups:")
+
+for feature in sensitive_features:
+    print(f"\n>> Sensitive Feature: {feature}")
+    priv_train = privileged_groups_train[feature]
+    priv_test = privileged_groups_test[feature]
+    groups = test_samples[feature].unique()
+
+    feat_idx = feature_index_map[feature]
+    feature_shap = shap_values_positive[:, feat_idx]
+
+    plot_data = []
+    for group in groups:
+        group_idx = test_samples[feature] == group
+        group_shap_values = feature_shap[group_idx]
+        for value in group_shap_values:
+            plot_data.append({'Group': group, 'SHAP Value': value})
+
+    plot_df = pd.DataFrame(plot_data)
+
+    plt.figure(figsize=(10, 6))
+
+    colors = []
+    for group in groups:
+        if group == priv_train and group == priv_test:
+            colors.append('purple')
+        elif group == priv_train:
+            colors.append('green')
+        elif group == priv_test:
+            colors.append('orange')
+        else:
+            colors.append('blue')
+
+    box = sns.boxplot(x='Group', y='SHAP Value', data=plot_df, palette=colors)
+
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='green', label='Training Privileged'),
+        Patch(facecolor='orange', label='Test Privileged'),
+        Patch(facecolor='purple', label='Both'),
+        Patch(facecolor='blue', label='Neither')
+    ]
+    plt.legend(handles=legend_elements, loc='best')
+
+    plt.title(f'SHAP Value Distribution for {feature}\nTrain Priv: {priv_train}, Test Priv: {priv_test}')
+    plt.tight_layout()
+    plt.show()
+
+    print("\nStatistical significance tests:")
+    h_stat, p_value = stats.kruskal(*[plot_df[plot_df['Group'] == g]['SHAP Value'] for g in groups])
+    print(f"Kruskal-Wallis Test: H-stat = {h_stat:.4f}, p-value = {p_value:.4f}")
+
+    if priv_train in groups:
+        unprivileged = [g for g in groups if g != priv_train]
+        for group in unprivileged:
+            group1 = plot_df[plot_df['Group'] == priv_train]['SHAP Value']
+            group2 = plot_df[plot_df['Group'] == group]['SHAP Value']
+            u_stat, p_value = stats.mannwhitneyu(group1, group2, alternative='two-sided')
+            print(f"Train Privileged ({priv_train}) vs {group}: U-stat = {u_stat:.4f}, p-value = {p_value:.4f}")
+    else:
+        print(f"Training privileged group {priv_train} not found in test set")
+
+    if priv_test in groups and priv_test != priv_train:
+        unprivileged = [g for g in groups if g != priv_test]
+        for group in unprivileged:
+            group1 = plot_df[plot_df['Group'] == priv_test]['SHAP Value']
+            group2 = plot_df[plot_df['Group'] == group]['SHAP Value']
+            u_stat, p_value = stats.mannwhitneyu(group1, group2, alternative='two-sided')
+            print(f"Test Privileged ({priv_test}) vs {group}: U-stat = {u_stat:.4f}, p-value = {p_value:.4f}")
+
+print("\n3. EXPLANATION CONSISTENCY:")
+print("-"*60)
+print("Measuring consistency of explanations within groups:")
+
+explanation_consistency = {}
+for feature in sensitive_features:
+    groups = test_samples[feature].unique()
+    consistency_scores = []
+
+    for group in groups:
+        group_idx = test_samples[feature] == group
+        group_shap = shap_values_positive[group_idx]
+
+        if len(group_shap) <= 1:
+            consistency_score = 1.0
+        else:
+            similarity_matrix = cosine_similarity(group_shap)
+            np.fill_diagonal(similarity_matrix, np.nan)
+            consistency_score = np.nanmean(similarity_matrix)
+        consistency_scores.append(consistency_score)
+
+    explanation_consistency[feature] = consistency_scores
+
+    priv_train = privileged_groups_train[feature]
+    priv_test = privileged_groups_test[feature]
+    print(f"\n{feature} group explanation consistency:")
+    print(f"  - Training Privileged Group: {priv_train}")
+    print(f"  - Test Privileged Group: {priv_test}")
+
+    for group, score in zip(groups, consistency_scores):
+        status = []
+        if group == priv_train:
+            status.append("TRAIN-PRIV")
+        if group == priv_test:
+            status.append("TEST-PRIV")
+        status_str = "[" + ", ".join(status) + "]" if status else ""
+        print(f"- Group {group} {status_str}: {score:.4f}")
+
+# ===================================================
+# Scientific Interpretation with CI
+# ===================================================
+print("="*80)
+print("SCIENTIFIC INTERPRETATION WITH 95% CONFIDENCE INTERVALS")
+print("="*80)
+
+print("\n1. PERFORMANCE ANALYSIS:")
+print("-"*60)
+print("Cross-Validation Performance (95% CI):")
+for metric, ci in perf_ci.items():
+    print(f"  - {metric}: {ci['mean']:.4f} ({ci['lower']:.4f}-{ci['upper']:.4f})")
+
+print("\nValidation Set Performance:")
+for metric, value in val_metrics.items():
+    print(f"  - {metric}: {value:.4f}")
+
+print("\nTest Set Performance:")
+for metric, value in test_metrics.items():
+    print(f"  - {metric}: {value:.4f}")
+
+print("\n2. FAIRNESS ASSESSMENT:")
+print("-"*60)
+print("Cross-Validation Fairness (95% CI):")
+for feat, metrics in fairness_ci.items():
+    print(f"\nSensitive Feature: {feat} (Training Privileged: {privileged_groups_train[feat]})")
+    for metric, ci in metrics.items():
+        print(f"  - {metric}: {ci['mean']:.4f} ({ci['lower']:.4f}-{ci['upper']:.4f})")
+
+print("\nTest Set Fairness Metrics:")
+for feature, results in test_fairness.items():
+    print(f"\nSensitive Feature: {feature}")
+    print(f"  - Training Privileged Group: {privileged_groups_train[feature]}")
+    print(f"  - Test Privileged Group: {privileged_groups_test[feature]}")
+    print(f"  - Equal Opportunity Difference: {results['Equal_Opportunity_Diff']:.4f}")
+    print(f"  - Statistical Parity Difference: {results['Statistical_Parity_Diff']:.4f}")
+    print(f"  - Fairness Ratio: {results['Fairness_Ratio']:.4f}")
+    print(f"  - Equalised Odds Difference: {results['Equalised_Odds_Difference']:.4f}")
+
+print("\n3. EXPLANATION FAIRNESS ASSESSMENT:")
+print("-"*60)
+print("Key findings from explanation fairness analysis:")
+for feature in sensitive_features:
+    print(f"\n>> {feature}:")
+    print(f"  - Training Privileged Group: {privileged_groups_train[feature]}")
+    print(f"  - Test Privileged Group: {privileged_groups_test[feature]}")
+
+    groups = test_samples[feature].unique()
+    consistency_scores = explanation_consistency[feature]
+    priv_train = privileged_groups_train[feature]
+    priv_test = privileged_groups_test[feature]
+
+    min_consistency = min(consistency_scores)
+    max_consistency = max(consistency_scores)
+    overall_gap = max_consistency - min_consistency
+
+    if priv_train in groups:
+        priv_train_idx = np.where(groups == priv_train)[0][0]
+        priv_train_consistency = consistency_scores[priv_train_idx]
+        print(f"  - SHAP Training Privileged Consistency: {priv_train_consistency:.4f}")
+    else:
+        print(f"  - Training privileged group '{priv_train}' not found in test set")
+        priv_train_consistency = None
+
+    if priv_test in groups:
+        priv_test_idx = np.where(groups == priv_test)[0][0]
+        priv_test_consistency = consistency_scores[priv_test_idx]
+        print(f"  - SHAP Test Privileged Consistency: {priv_test_consistency:.4f}")
+    else:
+        print(f"  - Test privileged group '{priv_test}' not found in test set")
+        priv_test_consistency = None
+
+    print(f"  - SHAP Minimum Consistency: {min_consistency:.4f}")
+    print(f"  - SHAP Maximum Consistency: {max_consistency:.4f}")
+    print(f"  - SHAP Overall Consistency Gap: {overall_gap:.4f}")
+
+    if priv_train_consistency is not None:
+        train_gap = priv_train_consistency - min_consistency
+        print(f"  - SHAP Training Privileged Gap: {train_gap:.4f}")
+
+    if priv_test_consistency is not None:
+        test_gap = priv_test_consistency - min_consistency
+        print(f"  - SHAP Test Privileged Gap: {test_gap:.4f}")
+
+# ===================================================
+# SHAP Consistency Gap Analysis
+# ===================================================
+print("\n" + "="*80)
+print("SHAP CONSISTENCY GAP ANALYSIS")
+print("="*80)
+
+shap_consistency_gap_showed = False
+
+for feature in sensitive_features:
+    groups = test_samples[feature].unique()
+    consistency_scores = explanation_consistency[feature]
+    min_consistency = min(consistency_scores)
+    max_consistency = max(consistency_scores)
+    overall_gap = max_consistency - min_consistency
+
+    print(f"\n{feature}:")
+    print(f"  - SHAP Minimum Consistency: {min_consistency:.4f}")
+    print(f"  - SHAP Maximum Consistency: {max_consistency:.4f}")
+    print(f"  - SHAP Overall Consistency Gap: {overall_gap:.4f}")
+
+    if overall_gap > 0.05:  # Significant gap threshold
+        shap_consistency_gap_showed = True
+        print("  ➤ SIGNIFICANT SHAP CONSISTENCY GAP DETECTED")
+    else:
+        print("  ➤ No significant SHAP consistency gap detected")
+
+print("\n" + "="*80)
+print("OVERALL CONCLUSION ON SHAP CONSISTENCY GAP")
+print("="*80)
+if shap_consistency_gap_showed:
+    print("YES, the analysis showed significant SHAP Consistency Gap")
+    print("• Different demographic groups received explanations with varying consistency")
+    print("• The gap between the most and least consistent groups exceeded 0.05")
+    print("• This indicates potential fairness issues in model explanations")
+else:
+    print("NO significant SHAP Consistency Gap was detected")
+    print("• Explanations were reasonably consistent across demographic groups")
+    print("• The gap between the most and least consistent groups was below 0.05")
+    print("• Model explanations show consistent behavior across protected attributes")
+
+print("\nRecommendations:")
+print("- For significant gaps: Implement explanation-aware fairness constraints")
+print("- Monitor SHAP consistency regularly as part of model audits")
+print("- Consider using adversarial training to align explanations across groups")
+print("- Set explanation consistency thresholds in model deployment standards")
+
+-----------------END---------------------------------------------
